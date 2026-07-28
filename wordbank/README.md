@@ -16,12 +16,15 @@ Python 3.10+ and `ffmpeg`/`ffprobe` are required.
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -e '.[test]'
-wordbank serve
+wordbank serve   # DB + samples → ~/peteedoo/samples
 ```
 
-Open http://127.0.0.1:8000. The default transcriber is the JSON sidecar
-transcriber, useful for offline operation and tests. A clip `speech.wav` can
-have `speech.json` containing `{"words":[{"text":"hello","start":0.1,"end":0.4}]}`.
+Open http://127.0.0.1:8000. Data lives in `~/peteedoo/samples` by default
+(`wordbank.sqlite3`, source `audio/`, library cuts under `samples/`, and
+published label-named WAVs in that same folder). The default transcriber is the
+JSON sidecar transcriber, useful for offline operation and tests. A clip
+`speech.wav` can have `speech.json` containing
+`{"words":[{"text":"hello","start":0.1,"end":0.4}]}`.
 
 For real transcription:
 
@@ -63,8 +66,7 @@ wordbank search "make some noise" --speaker "MC"
 wordbank export 1 2 4 --label "noise phrase" --publish
 wordbank publish 3 --dest "/Volumes/Music_Studio/DJ Music/Wordbank"
 wordbank timing 1
-wordbank serve   # uses ~/peteedoo/samples for DB + published WAVs
-wordbank --data-dir ~/peteedoo/samples --export-dir ~/peteedoo/samples serve
+wordbank serve
 ```
 
 ## UI notes
