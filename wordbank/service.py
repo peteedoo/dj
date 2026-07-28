@@ -67,6 +67,17 @@ def discover_audio_files(folder: Path) -> list[Path]:
     return files
 
 
+def default_data_dir() -> Path:
+    """Ryan's sample library + SQLite home: ~/peteedoo/samples."""
+    return Path.home() / "peteedoo" / "samples"
+
+
+def resolve_dir(path: str | Path | None, fallback: Path) -> Path:
+    if path is None or path == "":
+        return fallback
+    return Path(path).expanduser().resolve()
+
+
 class WordBank:
     def __init__(
         self,
@@ -74,17 +85,17 @@ class WordBank:
         transcriber: Transcriber | None = None,
         export_dir: str | Path | None = None,
     ) -> None:
-        configured_dir = data_dir or os.getenv(
-            "WORDBANK_DATA_DIR", "wordbank/data"
+        configured_dir = data_dir if data_dir is not None else os.getenv(
+            "WORDBANK_DATA_DIR"
         )
-        self.store = Store(configured_dir)
+        self.store = Store(resolve_dir(configured_dir, default_data_dir()))
         self.transcriber = transcriber or transcriber_from_env()
-        configured_export = export_dir or os.getenv("WORDBANK_EXPORT_DIR")
-        self.export_dir = (
-            Path(configured_export)
-            if configured_export
-            else self.store.data_dir / "dj-export"
+        configured_export = (
+            export_dir if export_dir is not None else os.getenv("WORDBANK_EXPORT_DIR")
         )
+        # Published label-named WAVs land in the same folder as the database
+        # unless WORDBANK_EXPORT_DIR / --export-dir overrides it.
+        self.export_dir = resolve_dir(configured_export, self.store.data_dir)
 
     def ingest(
         self,
@@ -259,7 +270,9 @@ class WordBank:
         sample = self.store.sample(sample_id)
         if sample is None:
             raise ValueError("Sample not found")
-        destination_root = Path(export_dir) if export_dir else self.export_dir
+        destination_root = (
+            Path(export_dir).expanduser() if export_dir else self.export_dir
+        )
         destination_root.mkdir(parents=True, exist_ok=True)
         basename = sanitize_label_filename(
             sample["label"] or sample["text"] or f"sample-{sample_id}"

@@ -43,9 +43,12 @@ confidence and suspicious gaps.
 
 ## Environment
 
-* `WORDBANK_DATA_DIR` — SQLite/audio directory, default `wordbank/data/`.
-* `WORDBANK_EXPORT_DIR` — Serato/Rekordbox watch folder for `publish`
-  (default `$DATA_DIR/dj-export`).
+* `WORDBANK_DATA_DIR` — SQLite + working audio directory, default
+  `~/peteedoo/samples` (`wordbank.sqlite3`, `audio/`, `samples/`).
+* `WORDBANK_EXPORT_DIR` — folder for published label-named WAVs (Serato /
+  Rekordbox watch). Defaults to the same path as `WORDBANK_DATA_DIR`
+  (`~/peteedoo/samples`), so `publish` drops `Make_Some_Noise.wav` next to
+  the database.
 * `WORDBANK_TRANSCRIBER` — `json` (default), `faster-whisper` / `whisper`, or
   `whisperx` / `aligned`.
 * `WORDBANK_MODEL` — model name, default `small`.
@@ -60,7 +63,8 @@ wordbank search "make some noise" --speaker "MC"
 wordbank export 1 2 4 --label "noise phrase" --publish
 wordbank publish 3 --dest "/Volumes/Music_Studio/DJ Music/Wordbank"
 wordbank timing 1
-wordbank --data-dir /path/to/wordbank-data --export-dir /path/to/watch serve
+wordbank serve   # uses ~/peteedoo/samples for DB + published WAVs
+wordbank --data-dir ~/peteedoo/samples --export-dir ~/peteedoo/samples serve
 ```
 
 ## UI notes

@@ -60,8 +60,8 @@ def normalize(word: str) -> str:
 
 
 class Store:
-    def __init__(self, data_dir: str | Path = "wordbank/data") -> None:
-        self.data_dir = Path(data_dir)
+    def __init__(self, data_dir: str | Path) -> None:
+        self.data_dir = Path(data_dir).expanduser()
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.db_path = self.data_dir / "wordbank.sqlite3"
         self.audio_dir = self.data_dir / "audio"

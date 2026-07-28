@@ -9,7 +9,12 @@ from fastapi.testclient import TestClient
 from wordbank.api import create_app
 from wordbank import cli
 from wordbank.export_util import sanitize_label_filename, unique_path
-from wordbank.service import WordBank, discover_audio_files
+from wordbank.service import (
+    WordBank,
+    default_data_dir,
+    discover_audio_files,
+    resolve_dir,
+)
 from wordbank.transcription import (
     FasterWhisperTranscriber,
     JSONTranscriber,
@@ -262,7 +267,9 @@ def test_api_routes(tmp_path, clip_file):
     assert client.get("/clips/999").status_code == 404
     assert client.get("/samples/999/audio").status_code == 404
     assert client.delete("/samples/999").status_code == 404
-    assert client.get("/settings").json()["export_dir"].endswith("dj-export")
+    settings = client.get("/settings").json()
+    assert Path(settings["export_dir"]) == bank.export_dir
+    assert Path(settings["data_dir"]) == bank.store.data_dir
 
 
 def test_cli_serve_uses_data_dir(monkeypatch, tmp_path):
@@ -390,3 +397,21 @@ def test_sanitize_label_filename(tmp_path):
     assert path == tmp_path / "x.wav"
     path.write_text("a")
     assert unique_path(tmp_path, "x").name == "x_2.wav"
+
+
+def test_default_data_dir_is_peteedoo_samples(monkeypatch, tmp_path):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("WORDBANK_DATA_DIR", raising=False)
+    monkeypatch.delenv("WORDBANK_EXPORT_DIR", raising=False)
+    assert default_data_dir() == tmp_path / "peteedoo" / "samples"
+    bank = WordBank(transcriber=JSONTranscriber())
+    assert bank.store.data_dir == (tmp_path / "peteedoo" / "samples").resolve()
+    assert bank.export_dir == bank.store.data_dir
+    assert (bank.store.data_dir / "wordbank.sqlite3").exists()
+
+
+def test_resolve_dir_expands_user(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    assert resolve_dir("~/peteedoo/samples", Path("/fallback")) == (
+        tmp_path / "peteedoo" / "samples"
+    ).resolve()
