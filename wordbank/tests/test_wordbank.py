@@ -1,7 +1,6 @@
 import json
 import subprocess
 import sys
-from types import SimpleNamespace
 from pathlib import Path
 
 import pytest
@@ -116,7 +115,7 @@ def test_cli_serve_uses_data_dir(monkeypatch, tmp_path):
         captured["run"] = (app, host, port)
 
     monkeypatch.setattr(cli, "create_app", fake_create_app)
-    monkeypatch.setitem(sys.modules, "uvicorn", SimpleNamespace(run=fake_run))
+    monkeypatch.setattr(cli.uvicorn, "run", fake_run)
     monkeypatch.setenv("WORDBANK_TRANSCRIBER", "json")
     monkeypatch.setattr(
         sys,
