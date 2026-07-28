@@ -34,7 +34,7 @@ For real transcription install `pip install -e '.[transcription]'` and set
 wordbank ingest clip.wav --speaker "MC"
 wordbank search "make some noise" --speaker "MC"
 wordbank export 1 2 4 --label "noise phrase"
-wordbank serve --host 0.0.0.0 --port 8000
+wordbank --data-dir /path/to/wordbank-data serve --host 0.0.0.0 --port 8000
 ```
 
 ## API
@@ -43,11 +43,13 @@ wordbank serve --host 0.0.0.0 --port 8000
 * `POST /clips` multipart fields `file`, optional `speaker`, and optional
   `transcript` JSON (useful with the JSON transcriber)
 * `GET /clips`, `GET /clips/{id}`, `GET /clips/{id}/audio`
-* `GET /search?q=phrase&speaker=...`
+* `GET /search?q=phrase&speaker=...&limit=50`
 * `POST /samples` JSON `{clip_id,start_word,end_word,label,pad_before,pad_after,tags}`
 * `POST /samples/{id}/expand` JSON `{before,after}`
 * `GET /samples?q=...&speaker=...&tag=...`
 * `GET /samples/{id}/audio`, `DELETE /samples/{id}`
 
 Samples default to 80ms before and 120ms after the selected word span,
-clamped to clip bounds, with short fades to avoid clicks.
+clamped to clip bounds, with short fades to avoid clicks. Expanding a sample
+creates a new sample with the wider word span and leaves the original sample
+intact.

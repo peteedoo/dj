@@ -1,20 +1,239 @@
 <!doctype html>
-<html><head><meta charset="utf-8"><title>Wordbank</title><style>
-:root{color-scheme:dark}body{font:15px system-ui;background:#101214;color:#ddd;max-width:1100px;margin:2rem auto;padding:0 1rem}button,input{background:#20252a;color:inherit;border:1px solid #48515a;padding:.5rem}button{cursor:pointer}.word{display:inline-block;padding:.35rem .25rem;margin:.1rem;cursor:pointer}.word:hover,.word.selected{background:#c77dff;color:#111}.panel{background:#181c20;padding:1rem;margin:1rem 0}.samples audio{width:220px}.muted{color:#89929b}
-</style></head><body><h1>WORD<span style="color:#c77dff">BANK</span></h1>
-<section class=panel><input type=file id=file accept=audio/*><input id=speaker placeholder="speaker"><button onclick=upload()>INGEST</button><span id=status class=muted></span></section>
-<section class=panel><input id=query placeholder="search words or phrases"><input id=filter placeholder="speaker"><button onclick=search()>SEARCH</button><div id=results></div></section>
-<section class=panel><h2 id=cliptitle>Transcript</h2><audio id=player controls></audio><div id=transcript></div><label>Before <input id=before type=number step=.01 value=-.08></label><label>After <input id=after type=number step=.01 value=.12></label><button onclick=sample()>MAKE SAMPLE</button></section>
-<section class="panel samples"><h2>Sample library</h2><div id=library></div></section>
-<script>
-let clip,selected=[];const $=id=>document.getElementById(id);
-async function upload(){let f=$('file').files[0];if(!f)return;let d=new FormData;d.append('file',f);d.append('speaker',$('speaker').value);$('status').textContent=' indexing…';let r=await fetch('/clips',{method:'POST',body:d});clip=await r.json();render();$('status').textContent=' ready';}
-function render(){ $('cliptitle').textContent=clip.original_filename; $('player').src='/clips/'+clip.id+'/audio';$('transcript').innerHTML=clip.words.map((w,i)=>`<span class=word data-i=${i} onclick="cue(${i})">${w.raw_word}</span>`).join('');document.querySelectorAll('.word').forEach(e=>e.onpointerdown=()=>{selected=[+e.dataset.i,+e.dataset.i];dragging=true;mark()});document.onpointerup=()=>dragging=false;document.querySelectorAll('.word').forEach(e=>e.onpointerenter=()=>{if(dragging)selected=[Math.min(selected[0],+e.dataset.i),Math.max(selected[0],+e.dataset.i)];mark()});}
-function cue(i){$('player').currentTime=clip.words[i].start;$('player').play();if(!selected.length)selected=[i];else selected=[Math.min(selected[0],i),Math.max(selected[0],i)];document.querySelectorAll('.word').forEach((e,n)=>e.classList.toggle('selected',selected.length===2&&n>=selected[0]&&n<=selected[1]));}
-function mark(){document.querySelectorAll('.word').forEach((e,n)=>e.classList.toggle('selected',n>=selected[0]&&n<=selected[1]));}
-async function search(){let r=await fetch('/search?q='+encodeURIComponent($('query').value)+'&speaker='+encodeURIComponent($('filter').value));let d=await r.json();$('results').innerHTML=d.hits.map(h=>`<p><button onclick="load(${h.clip_id},${h.word_start},${h.word_end})">${h.text}</button> <span class=muted>${h.speaker||''} @ ${h.start.toFixed(2)}s</span></p>`).join('');}
-async function load(id,a,b){clip=await (await fetch('/clips/'+id)).json();render();selected=[a,b];cue(a);}
-async function sample(){if(selected.length<2)return;await fetch('/samples',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({clip_id:clip.id,start_word:selected[0],end_word:selected[1],pad_before:+$('before').value,pad_after:+$('after').value})});samples();}
-async function samples(){let d=await (await fetch('/samples')).json();$('library').innerHTML=d.map(s=>`<p>${s.text} <audio controls src="/samples/${s.id}/audio"></audio> <a href="/samples/${s.id}/audio" download>download</a></p>`).join('');}
-samples();
-</script></body></html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Wordbank</title>
+  <style>
+    :root { color-scheme: dark; }
+    body {
+      background: #101214;
+      color: #ddd;
+      font: 15px system-ui;
+      margin: 2rem auto;
+      max-width: 1100px;
+      padding: 0 1rem;
+    }
+    button, input {
+      background: #20252a;
+      border: 1px solid #48515a;
+      color: inherit;
+      padding: .5rem;
+    }
+    button { cursor: pointer; }
+    .word {
+      cursor: pointer;
+      display: inline-block;
+      margin: .1rem;
+      padding: .35rem .25rem;
+      user-select: none;
+    }
+    .word:hover, .word.selected { background: #c77dff; color: #111; }
+    .panel { background: #181c20; margin: 1rem 0; padding: 1rem; }
+    .sample-row { border-top: 1px solid #30363b; padding: .75rem 0; }
+    .samples audio { width: 220px; }
+    .muted { color: #89929b; }
+  </style>
+</head>
+<body>
+  <h1>WORD<span style="color:#c77dff">BANK</span></h1>
+  <section class="panel">
+    <input type="file" id="file" accept="audio/*">
+    <input id="speaker" placeholder="speaker">
+    <button id="upload">INGEST</button>
+    <span id="status" class="muted"></span>
+  </section>
+  <section class="panel">
+    <input id="query" placeholder="search words or phrases">
+    <input id="filter" placeholder="speaker">
+    <input id="search-limit" type="number" min="1" value="50">
+    <button id="search">SEARCH</button>
+    <div id="results"></div>
+  </section>
+  <section class="panel">
+    <h2 id="cliptitle">Transcript</h2>
+    <audio id="player" controls></audio>
+    <div id="transcript"></div>
+    <label>Before <input id="before" type="number" step=".01" value="-.08"></label>
+    <label>After <input id="after" type="number" step=".01" value=".12"></label>
+    <input id="sample-label" placeholder="sample label">
+    <input id="sample-tags" placeholder="tags,comma,separated">
+    <button id="make-sample">MAKE SAMPLE</button>
+  </section>
+  <section class="panel samples">
+    <h2>Sample library</h2>
+    <div id="library"></div>
+  </section>
+  <script>
+    let clip = null;
+    let selected = [];
+    let selectionAnchor = null;
+    let dragging = false;
+
+    const element = (id) => document.getElementById(id);
+
+    function setSelection(start, end = start) {
+      selected = [Math.min(start, end), Math.max(start, end)];
+      document.querySelectorAll(".word").forEach((word) => {
+        const index = Number(word.dataset.index);
+        word.classList.toggle(
+          "selected",
+          index >= selected[0] && index <= selected[1],
+        );
+      });
+    }
+
+    function cueWord(index) {
+      element("player").currentTime = clip.words[index].start;
+      element("player").play();
+    }
+
+    function renderTranscript() {
+      element("cliptitle").textContent = clip.original_filename;
+      element("player").src = `/clips/${clip.id}/audio`;
+      const transcript = element("transcript");
+      transcript.innerHTML = "";
+      clip.words.forEach((word, index) => {
+        const wordElement = document.createElement("span");
+        wordElement.className = "word";
+        wordElement.dataset.index = index;
+        wordElement.textContent = word.raw_word;
+        wordElement.addEventListener("pointerdown", (event) => {
+          event.preventDefault();
+          dragging = true;
+          cueWord(index);
+          selectionAnchor = index;
+          setSelection(index);
+        });
+        wordElement.addEventListener("pointerenter", () => {
+          if (dragging) {
+            setSelection(selectionAnchor, index);
+          }
+        });
+        transcript.appendChild(wordElement);
+      });
+    }
+
+    document.addEventListener("pointerup", () => {
+      dragging = false;
+    });
+
+    async function uploadClip() {
+      const file = element("file").files[0];
+      if (!file) {
+        return;
+      }
+      const form = new FormData();
+      form.append("file", file);
+      if (element("speaker").value) {
+        form.append("speaker", element("speaker").value);
+      }
+      element("status").textContent = " indexing…";
+      const response = await fetch("/clips", { method: "POST", body: form });
+      if (!response.ok) {
+        element("status").textContent = " upload failed";
+        return;
+      }
+      clip = await response.json();
+      selected = [];
+      renderTranscript();
+      await refreshSamples();
+      element("status").textContent = " ready";
+    }
+
+    async function searchClips() {
+      const parameters = new URLSearchParams({
+        q: element("query").value,
+        limit: element("search-limit").value || "50",
+      });
+      const speaker = element("filter").value.trim();
+      if (speaker) {
+        parameters.set("speaker", speaker);
+      }
+      const response = await fetch(`/search?${parameters}`);
+      const data = await response.json();
+      element("results").innerHTML = "";
+      data.hits.forEach((hit) => {
+        const row = document.createElement("p");
+        const button = document.createElement("button");
+        button.textContent = hit.text;
+        button.addEventListener("click", () => loadClip(hit));
+        row.appendChild(button);
+        row.append(` ${hit.speaker || ""} @ ${hit.start.toFixed(2)}s`);
+        element("results").appendChild(row);
+      });
+    }
+
+    async function loadClip(hit) {
+      const response = await fetch(`/clips/${hit.clip_id}`);
+      clip = await response.json();
+      renderTranscript();
+      selectionAnchor = hit.word_start;
+      setSelection(hit.word_start, hit.word_end);
+      cueWord(hit.word_start);
+    }
+
+    async function makeSample() {
+      if (!clip || selected.length === 0) {
+        return;
+      }
+      await fetch("/samples", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          clip_id: clip.id,
+          start_word: selected[0],
+          end_word: selected[1],
+          label: element("sample-label").value,
+          tags: element("sample-tags").value,
+          pad_before: Number(element("before").value),
+          pad_after: Number(element("after").value),
+        }),
+      });
+      await refreshSamples();
+    }
+
+    async function expandSample(sampleId) {
+      const before = Number(document.querySelector(
+        `[data-before="${sampleId}"]`,
+      ).value);
+      const after = Number(document.querySelector(
+        `[data-after="${sampleId}"]`,
+      ).value);
+      await fetch(`/samples/${sampleId}/expand`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ before, after }),
+      });
+      await refreshSamples();
+    }
+
+    async function refreshSamples() {
+      const response = await fetch("/samples");
+      const samples = await response.json();
+      element("library").innerHTML = "";
+      samples.forEach((sample) => {
+        const row = document.createElement("div");
+        row.className = "sample-row";
+        row.innerHTML = `
+          <strong>${sample.label || sample.text}</strong>
+          <span class="muted">${sample.speaker || ""}</span>
+          <audio controls src="/samples/${sample.id}/audio"></audio>
+          <a href="/samples/${sample.id}/audio" download>download</a>
+          <label>before <input data-before="${sample.id}" type="number" value="0" min="0"></label>
+          <label>after <input data-after="${sample.id}" type="number" value="0" min="0"></label>
+        `;
+        const button = document.createElement("button");
+        button.textContent = "EXPAND";
+        button.addEventListener("click", () => expandSample(sample.id));
+        row.appendChild(button);
+        element("library").appendChild(row);
+      });
+    }
+
+    element("upload").addEventListener("click", uploadClip);
+    element("search").addEventListener("click", searchClips);
+    element("make-sample").addEventListener("click", makeSample);
+    refreshSamples();
+  </script>
+</body>
+</html>
