@@ -30,6 +30,28 @@ def build_parser() -> argparse.ArgumentParser:
     batch.add_argument("folder")
     batch.add_argument("--speaker", required=True)
 
+    youtube = subcommands.add_parser(
+        "ingest-youtube",
+        help="Download a YouTube time window (default 30s) and ingest it",
+    )
+    youtube.add_argument("url")
+    youtube.add_argument("--speaker")
+    youtube.add_argument(
+        "--start",
+        default="0",
+        help="Start time in seconds or MM:SS / HH:MM:SS (default 0)",
+    )
+    youtube.add_argument(
+        "--end",
+        default=None,
+        help="End time; defaults to start+30s when omitted",
+    )
+    youtube.add_argument(
+        "--duration",
+        default=None,
+        help="Length from start when --end is omitted (default 30)",
+    )
+
     search = subcommands.add_parser("search")
     search.add_argument("query")
     search.add_argument("--speaker")
@@ -87,6 +109,15 @@ def main() -> None:
         result = bank.store.clip(clip_id)
     elif args.command == "ingest-batch":
         result = bank.ingest_batch(Path(args.folder), speaker=args.speaker)
+    elif args.command == "ingest-youtube":
+        clip_id = bank.ingest_youtube(
+            args.url,
+            speaker=args.speaker,
+            start=args.start,
+            end=args.end,
+            duration_seconds=args.duration,
+        )
+        result = bank.store.clip(clip_id)
     elif args.command == "search":
         result = bank.store.search(args.query, args.speaker, args.limit)
     elif args.command == "publish":

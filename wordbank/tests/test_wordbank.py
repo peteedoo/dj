@@ -209,6 +209,7 @@ def test_module_help_uses_cli_parser():
     assert "usage: wordbank" in result.stdout
     assert "serve" in result.stdout
     assert "ingest-batch" in result.stdout
+    assert "ingest-youtube" in result.stdout
     assert "publish" in result.stdout
     assert "timing" in result.stdout
 
@@ -415,3 +416,109 @@ def test_resolve_dir_expands_user(tmp_path, monkeypatch):
     assert resolve_dir("~/peteedoo/samples", Path("/fallback")) == (
         tmp_path / "peteedoo" / "samples"
     ).resolve()
+
+
+def test_youtube_timestamp_window():
+    from wordbank.youtube import parse_timestamp, resolve_window
+
+    assert parse_timestamp("1:05") == 65
+    assert parse_timestamp("1:02:03") == 3723
+    assert parse_timestamp(12.5) == 12.5
+    assert resolve_window(None, None, None) == (0.0, 30.0)
+    assert resolve_window("1:00", None, None) == (60.0, 90.0)
+    assert resolve_window("10", "25", None) == (10.0, 25.0)
+    assert resolve_window(5, None, 12) == (5.0, 17.0)
+    with pytest.raises(ValueError, match="after start"):
+        resolve_window(10, 10, None)
+    with pytest.raises(ValueError, match="max"):
+        resolve_window(0, 30 * 60 + 1, None)
+
+
+def test_ingest_youtube_uses_fetcher(tmp_path, clip_file):
+    from wordbank.models import Word
+
+    class StubTranscriber:
+        def transcribe(self, audio_path):
+            return [
+                Word("drop", 0.1, 0.4),
+                Word("the", 0.45, 0.6),
+                Word("beat", 0.7, 1.0),
+            ]
+
+    bank = WordBank(tmp_path / "data", StubTranscriber())
+    captured = {}
+
+    def fake_fetch(url, destination, start, end):
+        captured["args"] = (url, start, end)
+        destination.write_bytes(clip_file.read_bytes())
+        return {
+            "title": "Drop The Beat",
+            "video_id": "abc123",
+            "url": url,
+            "filename": "Drop_The_Beat_5-35.wav",
+            "start": start,
+            "end": end,
+        }
+
+    clip_id = bank.ingest_youtube(
+        "https://youtu.be/abc123",
+        speaker="MC",
+        start=5,
+        duration_seconds=30,
+        fetcher=fake_fetch,
+    )
+    clip = bank.store.clip(clip_id)
+    assert captured["args"] == ("https://youtu.be/abc123", 5.0, 35.0)
+    assert clip["speaker"] == "MC"
+    assert clip["original_filename"] == "Drop_The_Beat_5-35.wav"
+    assert clip["transcript"] == "drop the beat"
+
+
+def test_api_youtube_ingest(tmp_path, clip_file):
+    from wordbank.models import Word
+
+    class StubTranscriber:
+        def transcribe(self, audio_path):
+            return [Word("yeah", 0.1, 0.3)]
+
+    bank = WordBank(tmp_path / "data", StubTranscriber())
+
+    def fake_fetch(url, destination, start, end):
+        destination.write_bytes(clip_file.read_bytes())
+        return {
+            "title": "Yeah",
+            "video_id": "xyz",
+            "url": url,
+            "filename": "Yeah_0-30.wav",
+            "start": start,
+            "end": end,
+        }
+
+    def ingest_with_fake(
+        url,
+        speaker=None,
+        start=None,
+        end=None,
+        duration_seconds=None,
+        fetcher=None,
+    ):
+        return WordBank.ingest_youtube(
+            bank,
+            url,
+            speaker=speaker,
+            start=start,
+            end=end,
+            duration_seconds=duration_seconds,
+            fetcher=fake_fetch,
+        )
+
+    bank.ingest_youtube = ingest_with_fake  # type: ignore[method-assign]
+    client = TestClient(create_app(bank))
+    response = client.post(
+        "/clips/youtube",
+        json={"url": "https://www.youtube.com/watch?v=xyz", "speaker": "Crowd"},
+    )
+    assert response.status_code == 200
+    assert response.json()["speaker"] == "Crowd"
+    assert response.json()["original_filename"] == "Yeah_0-30.wav"
+    assert client.post("/clips/youtube", json={}).status_code == 400

@@ -2,12 +2,17 @@ import os
 import re
 import shutil
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .audio import duration, export_slice
 from .export_util import sanitize_label_filename, unique_path
 from .storage import Store
 from .transcription import Transcriber, transcriber_from_env
+from .youtube import (
+    DEFAULT_CLIP_SECONDS,
+    fetch_youtube_audio,
+    resolve_window,
+)
 
 EXPANSION_SUFFIX = re.compile(r"^(?P<label>.*) \(expanded(?P<terms>.*)\)$")
 EXPANSION_TERM = re.compile(r"([+-]\d+) (before|after)")
@@ -123,6 +128,34 @@ class WordBank:
             duration(destination),
             words,
         )
+
+    def ingest_youtube(
+        self,
+        url: str,
+        speaker: str | None = None,
+        start: str | float | int | None = None,
+        end: str | float | int | None = None,
+        duration_seconds: str | float | int | None = None,
+        fetcher: Callable[..., dict[str, str | float]] = fetch_youtube_audio,
+    ) -> int:
+        """Download a YouTube time window (default 30s from start) and ingest it."""
+        start_s, end_s = resolve_window(
+            start,
+            end,
+            duration_seconds,
+            default_duration=DEFAULT_CLIP_SECONDS,
+        )
+        temp = self.store.data_dir / f".youtube-{os.urandom(5).hex()}.wav"
+        try:
+            meta = fetcher(url, temp, start_s, end_s)
+            return self.ingest(
+                temp,
+                original_filename=str(meta["filename"]),
+                speaker=speaker,
+            )
+        finally:
+            temp.unlink(missing_ok=True)
+            temp.with_suffix(".json").unlink(missing_ok=True)
 
     def ingest_batch(
         self,

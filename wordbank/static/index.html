@@ -70,6 +70,16 @@
       <span id="status" class="muted"></span>
     </div>
     <p class="muted keys">Speaker is a label you type at upload — not automatic diarization.</p>
+    <div class="row" style="margin-top:.75rem">
+      <input id="youtube-url" placeholder="YouTube URL" style="flex:1;min-width:16rem">
+      <input id="yt-start" placeholder="start 0 or 1:05" style="width:7rem">
+      <input id="yt-end" placeholder="end (blank= +30s)" style="width:8rem">
+      <button id="youtube-import">IMPORT YOUTUBE</button>
+    </div>
+    <p class="muted keys">
+      Paste a YouTube link and a time window. Leave end blank for a 30-second grab from start
+      (start defaults to 0). Times accept seconds or MM:SS.
+    </p>
   </section>
   <section class="panel">
     <div class="row">
@@ -357,6 +367,41 @@
       element("status").textContent = ` batch ready: ${data.count} clips${errNote}`;
     }
 
+    async function importYoutube() {
+      const url = element("youtube-url").value.trim();
+      if (!url) {
+        return;
+      }
+      const payload = { url };
+      if (element("speaker").value.trim()) {
+        payload.speaker = element("speaker").value.trim();
+      }
+      const start = element("yt-start").value.trim();
+      const end = element("yt-end").value.trim();
+      if (start) {
+        payload.start = start;
+      }
+      if (end) {
+        payload.end = end;
+      }
+      element("status").textContent = " fetching YouTube…";
+      const response = await fetch("/clips/youtube", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      if (!response.ok) {
+        const detail = await response.text();
+        element("status").textContent = ` YouTube import failed: ${detail}`;
+        return;
+      }
+      clip = await response.json();
+      selected = [];
+      renderTranscript();
+      await refreshSamples();
+      element("status").textContent = ` youtube ready (${clip.duration.toFixed(1)}s)`;
+    }
+
     function renderHits() {
       element("results").innerHTML = "";
       hits.forEach((hit, index) => {
@@ -561,6 +606,7 @@
     document.addEventListener("keydown", onKeydown);
     element("upload").addEventListener("click", uploadClip);
     element("upload-batch").addEventListener("click", uploadBatch);
+    element("youtube-import").addEventListener("click", importYoutube);
     element("search").addEventListener("click", searchClips);
     element("make-sample").addEventListener("click", makeSample);
     element("timing-btn").addEventListener("click", showTiming);

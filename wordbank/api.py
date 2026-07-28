@@ -56,6 +56,28 @@ def create_app(bank: WordBank | None = None) -> FastAPI:
                 temp.with_suffix(".json").unlink(missing_ok=True)
         return {"clips": clips, "errors": errors, "count": len(clips)}
 
+    @app.post("/clips/youtube")
+    def ingest_youtube(payload: dict[str, Any]) -> dict[str, Any]:
+        url = (payload.get("url") or "").strip()
+        if not url:
+            raise HTTPException(400, "url is required")
+        try:
+            clip_id = wordbank.ingest_youtube(
+                url,
+                speaker=payload.get("speaker"),
+                start=payload.get("start"),
+                end=payload.get("end"),
+                duration_seconds=payload.get("duration"),
+            )
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(502, str(exc)) from exc
+        clip = wordbank.store.clip(clip_id)
+        if clip is None:
+            raise HTTPException(500, "Ingested clip missing")
+        return clip
+
     @app.get("/clips")
     def list_clips() -> list[dict[str, Any]]:
         return wordbank.store.clips()

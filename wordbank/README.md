@@ -62,6 +62,8 @@ confidence and suspicious gaps.
 ```bash
 wordbank ingest clip.wav --speaker "MC"
 wordbank ingest-batch ./acapellas/mc --speaker "MC"
+wordbank ingest-youtube "https://youtu.be/VIDEO" --speaker "MC"
+wordbank ingest-youtube "https://youtu.be/VIDEO" --start 1:05 --end 1:35 --speaker "MC"
 wordbank search "make some noise" --speaker "MC"
 wordbank export 1 2 4 --label "noise phrase" --publish
 wordbank publish 3 --dest "/Volumes/Music_Studio/DJ Music/Wordbank"
@@ -72,6 +74,8 @@ wordbank serve
 ## UI notes
 
 * **Batch ingest** — select multiple files, set a speaker label, click BATCH INGEST.
+* **YouTube import** — paste a URL, optional start/end (MM:SS or seconds). Blank end
+  grabs **30 seconds** from start (start defaults to 0).
 * **Keyboard auditioning** — after search: ↑/↓ or j/k through hits, Enter/Space
   to preview, ←/→ to nudge the word selection, Esc to clear.
 * **Waveform** — purple handles are pad edges; drag them instead of typing
@@ -88,6 +92,8 @@ Speaker is always a **label typed at upload**, not diarization.
 * `POST /clips` multipart fields `file`, optional `speaker`, optional
   `transcript` JSON (useful with the JSON transcriber)
 * `POST /clips/batch` multipart `files` (repeated) + optional `speaker`
+* `POST /clips/youtube` JSON `{url,speaker?,start?,end?,duration?}` — default
+  window is 30s from `start` (or 0)
 * `GET /clips`, `GET /clips/{id}`, `GET /clips/{id}/audio`,
   `GET /clips/{id}/timing`
 * `GET /search?q=phrase&speaker=...&limit=50`
