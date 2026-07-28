@@ -110,7 +110,15 @@ class Store:
         clip_duration: float,
         words: Iterable[Word],
     ) -> int:
-        word_list = list(words)
+        word_list = [
+            Word(
+                text=word.text.strip(),
+                start=word.start,
+                end=word.end,
+                confidence=word.confidence,
+            )
+            for word in words
+        ]
         transcript = " ".join(word.text for word in word_list)
         with self.connect() as database:
             cursor = database.execute(

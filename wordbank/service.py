@@ -112,11 +112,17 @@ class WordBank:
             len(clip["words"]) - 1,
             sample["end_word_index"] + after,
         )
+        added_before = sample["start_word_index"] - start_word
+        added_after = end_word - sample["end_word_index"]
+        expanded_label = (
+            f"{sample['label']} "
+            f"(expanded +{added_before} before, +{added_after} after)"
+        )
         return self.make_sample(
             sample["clip_id"],
             start_word,
             end_word,
-            sample["label"],
+            expanded_label,
             sample["pad_before"],
             sample["pad_after"],
             sample["tags"],

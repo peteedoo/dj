@@ -30,6 +30,40 @@ def clip_file(tmp_path):
 
 
 @pytest.fixture
+def whisper_clip_file(tmp_path):
+    audio = tmp_path / "whisper.wav"
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:duration=2",
+            "-ac",
+            "1",
+            "-ar",
+            "16000",
+            str(audio),
+        ],
+        capture_output=True,
+        check=True,
+    )
+    (tmp_path / "whisper.json").write_text(
+        json.dumps(
+            {
+                "words": [
+                    {"text": " Make", "start": 0.05, "end": 0.35},
+                    {"text": " some", "start": 0.45, "end": 0.8},
+                    {"text": " noise.", "start": 1.1, "end": 1.4},
+                ]
+            }
+        )
+    )
+    return audio
+
+
+@pytest.fixture
 def bank(tmp_path, clip_file):
     return WordBank(tmp_path / "data", JSONTranscriber())
 
@@ -66,6 +100,36 @@ def test_export_padding_clamp_duration_and_expand(bank, clip_file):
     assert float(probe.stdout) == pytest.approx(2, abs=.08)
     expanded = bank.expand_sample(sample["id"], after=2)
     assert expanded["end_word_index"] == 2
+    assert expanded["label"].startswith("Hello, (expanded ")
+
+
+def test_ingest_strips_transcription_token_whitespace(tmp_path, whisper_clip_file):
+    bank = WordBank(tmp_path / "data", JSONTranscriber())
+
+    clip_id = bank.ingest(whisper_clip_file)
+    clip = bank.store.clip(clip_id)
+
+    assert clip["transcript"] == "Make some noise."
+    assert [word["raw_word"] for word in clip["words"]] == [
+        "Make",
+        "some",
+        "noise.",
+    ]
+    sample = bank.make_sample(clip_id, 0, 2)
+    assert sample["text"] == "Make some noise."
+
+
+def test_module_help_uses_cli_parser():
+    result = subprocess.run(
+        [sys.executable, "-m", "wordbank.cli", "--help"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0
+    assert "usage: wordbank" in result.stdout
+    assert "serve" in result.stdout
 
 
 def test_api_routes(tmp_path, clip_file):
