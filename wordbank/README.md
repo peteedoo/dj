@@ -20,10 +20,11 @@ wordbank serve   # DB + samples → ~/peteedoo/samples
 ```
 
 Open http://127.0.0.1:8000. Data lives in `~/peteedoo/samples` by default
-(`wordbank.sqlite3`, source `audio/`, library cuts under `samples/`, and
-published label-named WAVs in that same folder). The default transcriber is the
-JSON sidecar transcriber, useful for offline operation and tests. A clip
-`speech.wav` can have `speech.json` containing
+(`wordbank.sqlite3`, source `audio/`, library cuts under `samples/`, temps under
+`.tmp/`, and published label-named WAVs under `published/`). Point Serato /
+Rekordbox at the `published/` folder. The default transcriber is the JSON sidecar
+transcriber, useful for offline operation and tests. A clip `speech.wav` can
+have `speech.json` containing
 `{"words":[{"text":"hello","start":0.1,"end":0.4}]}`.
 
 For real transcription:
@@ -47,15 +48,16 @@ confidence and suspicious gaps.
 ## Environment
 
 * `WORDBANK_DATA_DIR` — SQLite + working audio directory, default
-  `~/peteedoo/samples` (`wordbank.sqlite3`, `audio/`, `samples/`).
+  `~/peteedoo/samples` (`wordbank.sqlite3`, `audio/`, `samples/`, `.tmp/`).
 * `WORDBANK_EXPORT_DIR` — folder for published label-named WAVs (Serato /
-  Rekordbox watch). Defaults to the same path as `WORDBANK_DATA_DIR`
-  (`~/peteedoo/samples`), so `publish` drops `Make_Some_Noise.wav` next to
-  the database.
+  Rekordbox watch). Defaults to `~/peteedoo/samples/published`.
 * `WORDBANK_TRANSCRIBER` — `json` (default), `faster-whisper` / `whisper`, or
   `whisperx` / `aligned`.
 * `WORDBANK_MODEL` — model name, default `small`.
 * `WORDBANK_DEVICE` / `WORDBANK_COMPUTE_TYPE` — WhisperX device settings.
+
+See [`AUDIT.md`](AUDIT.md) for the 100-item functional bug/improvement list and
+what has already been fixed.
 
 ## CLI
 
