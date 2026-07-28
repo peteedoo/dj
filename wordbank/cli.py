@@ -3,6 +3,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+import uvicorn
+
 from .api import create_app
 from .service import WordBank
 
@@ -38,8 +40,6 @@ def main() -> None:
     bank = WordBank(args.data_dir)
 
     if args.command == "serve":
-        import uvicorn
-
         uvicorn.run(
             create_app(bank),
             host=args.host,
