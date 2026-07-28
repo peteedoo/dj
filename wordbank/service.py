@@ -1,4 +1,5 @@
 import os
+import re
 import shutil
 from pathlib import Path
 from typing import Any
@@ -6,6 +7,41 @@ from typing import Any
 from .audio import duration, export_slice
 from .storage import Store
 from .transcription import Transcriber, transcriber_from_env
+
+EXPANSION_SUFFIX = re.compile(r"^(?P<label>.*) \(expanded(?P<terms>.*)\)$")
+EXPANSION_TERM = re.compile(r"([+-]\d+) (before|after)")
+
+
+def expanded_label(
+    label: str,
+    added_before: int,
+    added_after: int,
+) -> str:
+    match = EXPANSION_SUFFIX.match(label)
+    if match is None:
+        base_label = label
+        previous_before = 0
+        previous_after = 0
+    else:
+        base_label = match.group("label")
+        previous_before = 0
+        previous_after = 0
+        for value, direction in EXPANSION_TERM.findall(match.group("terms")):
+            if direction == "before":
+                previous_before = int(value)
+            else:
+                previous_after = int(value)
+
+    total_before = previous_before + added_before
+    total_after = previous_after + added_after
+    terms = []
+    if total_before:
+        terms.append(f"+{total_before} before")
+    if total_after:
+        terms.append(f"+{total_after} after")
+    if not terms:
+        return base_label
+    return f"{base_label} (expanded {', '.join(terms)})"
 
 
 class WordBank:
@@ -114,15 +150,12 @@ class WordBank:
         )
         added_before = sample["start_word_index"] - start_word
         added_after = end_word - sample["end_word_index"]
-        expanded_label = (
-            f"{sample['label']} "
-            f"(expanded +{added_before} before, +{added_after} after)"
-        )
+        label = expanded_label(sample["label"], added_before, added_after)
         return self.make_sample(
             sample["clip_id"],
             start_word,
             end_word,
-            expanded_label,
+            label,
             sample["pad_before"],
             sample["pad_after"],
             sample["tags"],

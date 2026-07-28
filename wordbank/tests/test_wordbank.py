@@ -100,7 +100,22 @@ def test_export_padding_clamp_duration_and_expand(bank, clip_file):
     assert float(probe.stdout) == pytest.approx(2, abs=.08)
     expanded = bank.expand_sample(sample["id"], after=2)
     assert expanded["end_word_index"] == 2
-    assert expanded["label"].startswith("Hello, (expanded ")
+    assert expanded["label"] == "Hello, (expanded +2 after)"
+
+    expanded_again = bank.expand_sample(expanded["id"], after=1)
+    assert expanded_again["label"] == "Hello, (expanded +2 after)"
+
+
+def test_expansion_label_accumulates_current_span_once(bank, clip_file):
+    clip_id = bank.ingest(clip_file, speaker="Ada")
+    sample = bank.make_sample(clip_id, 0, 0, label="hello")
+
+    first_expansion = bank.expand_sample(sample["id"], after=1)
+    second_expansion = bank.expand_sample(first_expansion["id"], after=1)
+
+    assert first_expansion["label"] == "hello (expanded +1 after)"
+    assert second_expansion["label"] == "hello (expanded +2 after)"
+    assert second_expansion["label"].count("(expanded") == 1
 
 
 def test_ingest_strips_transcription_token_whitespace(tmp_path, whisper_clip_file):
