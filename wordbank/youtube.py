@@ -10,6 +10,8 @@ import tempfile
 from pathlib import Path
 from typing import Callable
 
+from .audio import AudioToolError, duration
+
 TIMESTAMP = re.compile(
     r"^(?:"
     r"(?:(?P<hours>\d+):)?(?P<minutes>\d+):(?P<seconds>\d+(?:\.\d+)?)"
@@ -23,8 +25,12 @@ YOUTUBE_HINT = re.compile(
     re.IGNORECASE,
 )
 
+AUDIO_SUFFIXES = {".wav", ".m4a", ".mp3", ".webm", ".opus", ".ogg", ".flac", ".aac"}
+
 DEFAULT_CLIP_SECONDS = 30.0
 MAX_CLIP_SECONDS = 30 * 60
+DOWNLOAD_TIMEOUT = 300
+DURATION_TOLERANCE = 2.5
 
 
 def parse_timestamp(value: str | float | int | None) -> float | None:
@@ -56,6 +62,8 @@ def resolve_window(
     duration: str | float | int | None = None,
     default_duration: float = DEFAULT_CLIP_SECONDS,
 ) -> tuple[float, float]:
+    if end is not None and end != "" and duration is not None and duration != "":
+        raise ValueError("Provide end or duration, not both")
     start_s = parse_timestamp(start) or 0.0
     if start_s < 0:
         raise ValueError("start must be >= 0")
@@ -79,13 +87,31 @@ def looks_like_youtube(url: str) -> bool:
     return bool(YOUTUBE_HINT.search(url))
 
 
-def _run(command: list[str]) -> subprocess.CompletedProcess[str]:
+def _run(
+    command: list[str],
+    timeout: int = DOWNLOAD_TIMEOUT,
+) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         command,
         capture_output=True,
         text=True,
         check=False,
+        timeout=timeout,
     )
+
+
+def _pick_audio(temp_dir: Path) -> Path:
+    preferred = list(temp_dir.glob("clip.wav"))
+    if preferred:
+        return preferred[0]
+    candidates = [
+        path
+        for path in sorted(temp_dir.glob("clip.*"))
+        if path.suffix.lower() in AUDIO_SUFFIXES and not path.name.endswith(".part")
+    ]
+    if not candidates:
+        raise RuntimeError("yt-dlp produced no audio file")
+    return candidates[0]
 
 
 def fetch_youtube_audio(
@@ -93,9 +119,11 @@ def fetch_youtube_audio(
     destination: Path,
     start: float,
     end: float,
-    runner: Callable[[list[str]], subprocess.CompletedProcess[str]] | None = None,
+    runner: Callable[..., subprocess.CompletedProcess[str]] | None = None,
 ) -> dict[str, str | float]:
     """Download [start, end) audio from a YouTube URL into destination WAV."""
+    if not looks_like_youtube(url):
+        raise ValueError("URL does not look like a YouTube link")
     run = runner or _run
     if shutil.which("yt-dlp") is None and runner is None:
         raise RuntimeError(
@@ -126,52 +154,66 @@ def fetch_youtube_audio(
             except json.JSONDecodeError:
                 pass
 
-        download = run(
-            [
-                "yt-dlp",
-                "--no-playlist",
-                "-f",
-                "bestaudio/best",
-                "-x",
-                "--audio-format",
-                "wav",
-                "--audio-quality",
-                "0",
-                "--download-sections",
-                format_section(start, end),
-                "--force-keyframes-at-cuts",
-                "-o",
-                output_template,
-                url,
-            ]
-        )
+        try:
+            download = run(
+                [
+                    "yt-dlp",
+                    "--no-playlist",
+                    "-f",
+                    "bestaudio/best",
+                    "-x",
+                    "--audio-format",
+                    "wav",
+                    "--audio-quality",
+                    "0",
+                    "--download-sections",
+                    format_section(start, end),
+                    "--force-keyframes-at-cuts",
+                    "-o",
+                    output_template,
+                    url,
+                ]
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError("yt-dlp timed out") from exc
         if download.returncode != 0:
             detail = (download.stderr or download.stdout or "").strip()
             raise RuntimeError(f"yt-dlp failed: {detail or download.returncode}")
 
-        candidates = sorted(temp_dir.glob("clip.*"))
-        if not candidates:
-            raise RuntimeError("yt-dlp produced no audio file")
-        raw = candidates[0]
-        # Normalize to 16 kHz mono WAV for Whisper / consistent library cuts.
-        convert = run(
-            [
-                "ffmpeg",
-                "-y",
-                "-i",
-                str(raw),
-                "-ac",
-                "1",
-                "-ar",
-                "16000",
-                "-acodec",
-                "pcm_s16le",
-                str(destination),
-            ]
-        )
+        raw = _pick_audio(temp_dir)
+        try:
+            convert = run(
+                [
+                    "ffmpeg",
+                    "-y",
+                    "-i",
+                    str(raw),
+                    "-ac",
+                    "1",
+                    "-ar",
+                    "16000",
+                    "-acodec",
+                    "pcm_s16le",
+                    str(destination),
+                ],
+                timeout=120,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError("ffmpeg convert timed out") from exc
         if convert.returncode != 0:
             detail = (convert.stderr or convert.stdout or "").strip()
             raise RuntimeError(f"ffmpeg convert failed: {detail or convert.returncode}")
+
+    try:
+        actual = duration(destination)
+    except AudioToolError as exc:
+        raise RuntimeError(str(exc)) from exc
+    expected = end - start
+    if abs(actual - expected) > DURATION_TOLERANCE:
+        raise RuntimeError(
+            f"Downloaded clip is {actual:.2f}s but requested {expected:.2f}s "
+            f"(start={start}, end={end}); try different cut points"
+        )
 
     safe_title = re.sub(r"[^\w\s\-.]+", "", title).strip() or video_id
     filename = f"{safe_title}_{start:.0f}-{end:.0f}.wav"
@@ -182,4 +224,5 @@ def fetch_youtube_audio(
         "filename": filename,
         "start": start,
         "end": end,
+        "actual_duration": actual,
     }

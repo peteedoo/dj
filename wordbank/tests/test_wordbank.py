@@ -298,6 +298,7 @@ def test_cli_serve_uses_data_dir(monkeypatch, tmp_path):
             "0.0.0.0",
             "--port",
             "9123",
+            "--allow-remote",
         ],
     )
 
@@ -317,9 +318,10 @@ def test_batch_ingest_folder(tmp_path, clip_file):
             (clip_file.with_suffix(".json")).read_text()
         )
     bank = WordBank(tmp_path / "data", JSONTranscriber())
-    clips = bank.ingest_batch(folder, speaker="MC")
-    assert len(clips) == 2
-    assert all(clip["speaker"] == "MC" for clip in clips)
+    result = bank.ingest_batch(folder, speaker="MC")
+    assert result["count"] == 2
+    assert result["errors"] == []
+    assert all(clip["speaker"] == "mc" for clip in result["clips"])
     assert discover_audio_files(folder)[0].name == "a.wav"
 
 
@@ -348,7 +350,7 @@ def test_api_batch_upload(tmp_path, clip_file):
     payload = response.json()
     assert payload["count"] == 2
     assert payload["errors"] == []
-    assert payload["clips"][0]["speaker"] == "Crowd"
+    assert payload["clips"][0]["speaker"] == "crowd"
     assert payload["clips"][0]["transcript"] == "make noise"
 
 
@@ -356,12 +358,12 @@ def test_publish_and_recut_preserve_word_indices(bank, clip_file, tmp_path):
     clip_id = bank.ingest(clip_file, speaker="Ada")
     sample = bank.make_sample(clip_id, 0, 1, label="make some noise")
     dest = tmp_path / "serato-watch"
-    published = bank.publish_sample(sample["id"], dest)
+    published = bank.publish_sample(sample["id"], dest, restrict=False)
     assert published.parent == dest
     assert published.name == "make_some_noise.wav"
     assert published.exists()
 
-    again = bank.publish_sample(sample["id"], dest)
+    again = bank.publish_sample(sample["id"], dest, restrict=False)
     assert again.name == "make_some_noise_2.wav"
 
     recut = bank.recut_sample(sample["id"], pad_before=-0.01, pad_after=0.2)
@@ -378,6 +380,7 @@ def test_publish_and_recut_preserve_word_indices(bank, clip_file, tmp_path):
         label="hello",
         publish=True,
         export_dir=dest,
+        restrict_publish=False,
     )
     assert Path(published_on_make["published_path"]).exists()
 
@@ -391,7 +394,7 @@ def test_timing_report_flags_gaps(bank, clip_file):
 
 
 def test_sanitize_label_filename(tmp_path):
-    assert sanitize_label_filename("Make some noise!") == "Make_some_noise!"
+    assert sanitize_label_filename("Make some noise!") == "Make_some_noise"
     assert sanitize_label_filename("a/b:c") == "abc"
     assert sanitize_label_filename("   ") == "sample"
     path = unique_path(tmp_path, "x")
@@ -407,7 +410,7 @@ def test_default_data_dir_is_peteedoo_samples(monkeypatch, tmp_path):
     assert default_data_dir() == tmp_path / "peteedoo" / "samples"
     bank = WordBank(transcriber=JSONTranscriber())
     assert bank.store.data_dir == (tmp_path / "peteedoo" / "samples").resolve()
-    assert bank.export_dir == bank.store.data_dir
+    assert bank.export_dir == bank.store.data_dir / "published"
     assert (bank.store.data_dir / "wordbank.sqlite3").exists()
 
 
@@ -469,7 +472,7 @@ def test_ingest_youtube_uses_fetcher(tmp_path, clip_file):
     )
     clip = bank.store.clip(clip_id)
     assert captured["args"] == ("https://youtu.be/abc123", 5.0, 35.0)
-    assert clip["speaker"] == "MC"
+    assert clip["speaker"] == "mc"
     assert clip["original_filename"] == "Drop_The_Beat_5-35.wav"
     assert clip["transcript"] == "drop the beat"
 
@@ -519,6 +522,66 @@ def test_api_youtube_ingest(tmp_path, clip_file):
         json={"url": "https://www.youtube.com/watch?v=xyz", "speaker": "Crowd"},
     )
     assert response.status_code == 200
-    assert response.json()["speaker"] == "Crowd"
+    assert response.json()["speaker"] == "crowd"
     assert response.json()["original_filename"] == "Yeah_0-30.wav"
     assert client.post("/clips/youtube", json={}).status_code == 400
+
+
+def test_phrase_search_limit_scans_past_first_token_noise(tmp_path, clip_file):
+    from wordbank.models import Word
+
+    class Stub:
+        def __init__(self, words):
+            self.words = words
+
+        def transcribe(self, path):
+            return self.words
+
+    bank = WordBank(tmp_path / "data", Stub([Word("the", 0.0, 0.1), Word("dog", 0.1, 0.2)]))
+    for _ in range(10):
+        bank.ingest(clip_file, speaker="a")
+    bank.transcriber = Stub([Word("the", 0.0, 0.1), Word("cat", 0.1, 0.2)])
+    bank.ingest(clip_file, speaker="b")
+    hits = bank.store.search("the cat", limit=5)
+    assert len(hits) == 1
+    assert hits[0]["text"] == "the cat"
+
+
+def test_inverted_pads_rejected(bank, clip_file):
+    clip_id = bank.ingest(clip_file, speaker="Ada")
+    with pytest.raises(ValueError, match="empty cut"):
+        bank.make_sample(clip_id, 0, 0, pad_before=0.5, pad_after=-0.5)
+
+
+def test_expand_zero_is_noop(bank, clip_file):
+    clip_id = bank.ingest(clip_file, speaker="Ada")
+    sample = bank.make_sample(clip_id, 0, 0, label="hello")
+    assert bank.expand_sample(sample["id"], 0, 0)["id"] == sample["id"]
+    with pytest.raises(ValueError, match=">= 0"):
+        bank.expand_sample(sample["id"], -1, 0)
+
+
+def test_delete_sample_removes_published_copy(bank, clip_file, tmp_path):
+    clip_id = bank.ingest(clip_file, speaker="Ada")
+    sample = bank.make_sample(clip_id, 0, 1, label="noise")
+    published = bank.publish_sample(sample["id"], tmp_path / "out", restrict=False)
+    assert published.exists()
+    assert bank.store.delete_sample(sample["id"]) is True
+    assert not published.exists()
+
+
+def test_youtube_rejects_non_youtube_and_both_bounds():
+    from wordbank.youtube import resolve_window
+
+    with pytest.raises(ValueError, match="not both"):
+        resolve_window(0, 10, 5)
+    bank = WordBank("/tmp/unused", JSONTranscriber())
+    with pytest.raises(ValueError, match="YouTube"):
+        bank.ingest_youtube("https://example.com/not-yt")
+
+
+def test_publish_path_must_stay_inside_export_root(bank, clip_file, tmp_path):
+    clip_id = bank.ingest(clip_file, speaker="Ada")
+    sample = bank.make_sample(clip_id, 0, 0, label="x")
+    with pytest.raises(ValueError, match="inside"):
+        bank.publish_sample(sample["id"], tmp_path / "elsewhere")

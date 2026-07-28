@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
+from .export_util import escape_like, normalize_speaker, normalize_tags
 from .models import Word
 
 SCHEMA = """
@@ -40,6 +41,7 @@ CREATE TABLE IF NOT EXISTS samples (
     pad_before REAL NOT NULL,
     pad_after REAL NOT NULL,
     exported_path TEXT NOT NULL,
+    published_path TEXT,
     speaker TEXT,
     tags TEXT NOT NULL,
     created_at TEXT NOT NULL
@@ -66,19 +68,31 @@ class Store:
         self.db_path = self.data_dir / "wordbank.sqlite3"
         self.audio_dir = self.data_dir / "audio"
         self.sample_dir = self.data_dir / "samples"
+        self.tmp_dir = self.data_dir / ".tmp"
         self.audio_dir.mkdir(exist_ok=True)
         self.sample_dir.mkdir(exist_ok=True)
+        self.tmp_dir.mkdir(exist_ok=True)
         self.init()
 
     def connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.db_path)
+        connection = sqlite3.connect(self.db_path, timeout=30)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys=ON")
+        connection.execute("PRAGMA journal_mode=WAL")
+        connection.execute("PRAGMA synchronous=NORMAL")
         return connection
 
     def init(self) -> None:
         with self.connect() as database:
             database.executescript(SCHEMA)
+            columns = {
+                row["name"]
+                for row in database.execute("PRAGMA table_info(samples)")
+            }
+            if "published_path" not in columns:
+                database.execute(
+                    "ALTER TABLE samples ADD COLUMN published_path TEXT"
+                )
 
     def clip(self, clip_id: int) -> dict[str, Any] | None:
         with self.connect() as database:
@@ -110,16 +124,23 @@ class Store:
         clip_duration: float,
         words: Iterable[Word],
     ) -> int:
-        word_list = [
-            Word(
-                text=word.text.strip(),
-                start=word.start,
-                end=word.end,
-                confidence=word.confidence,
+        word_list = []
+        for word in words:
+            text = word.text.strip()
+            if not text or not normalize(text):
+                continue
+            if word.end <= word.start:
+                continue
+            word_list.append(
+                Word(
+                    text=text,
+                    start=word.start,
+                    end=word.end,
+                    confidence=word.confidence,
+                )
             )
-            for word in words
-        ]
         transcript = " ".join(word.text for word in word_list)
+        speaker = normalize_speaker(speaker)
         with self.connect() as database:
             cursor = database.execute(
                 """
@@ -153,6 +174,29 @@ class Store:
             )
         return clip_id
 
+    def delete_clip(self, clip_id: int) -> bool:
+        clip = self.clip(clip_id)
+        if clip is None:
+            return False
+        samples = self.samples_for_clip(clip_id)
+        with self.connect() as database:
+            database.execute("DELETE FROM clips WHERE id=?", (clip_id,))
+        Path(clip["audio_path"]).unlink(missing_ok=True)
+        Path(clip["audio_path"]).with_suffix(".json").unlink(missing_ok=True)
+        for sample in samples:
+            Path(sample["exported_path"]).unlink(missing_ok=True)
+            published = sample.get("published_path")
+            if published:
+                Path(published).unlink(missing_ok=True)
+        return True
+
+    def samples_for_clip(self, clip_id: int) -> list[dict[str, Any]]:
+        with self.connect() as database:
+            rows = database.execute(
+                "SELECT * FROM samples WHERE clip_id=?", (clip_id,)
+            )
+            return [dict(row) for row in rows]
+
     def search(
         self,
         query: str,
@@ -163,7 +207,8 @@ class Store:
         tokens = [token for token in tokens if token]
         if not tokens:
             return []
-        limit = max(1, limit)
+        limit = max(1, min(int(limit), 500))
+        speaker = normalize_speaker(speaker)
         with self.connect() as database:
             parameters: list[Any] = [tokens[0]]
             sql = """
@@ -175,8 +220,8 @@ class Store:
             if speaker:
                 sql += " AND clips.speaker=?"
                 parameters.append(speaker)
-            sql += " ORDER BY words.clip_id, words.position LIMIT ?"
-            parameters.append(limit)
+            # Scan all first-token matches; limit applies to finished phrase hits.
+            sql += " ORDER BY words.clip_id, words.position"
             candidates = database.execute(sql, parameters).fetchall()
             hits: list[dict[str, Any]] = []
             for first in candidates:
@@ -226,11 +271,16 @@ class Store:
                         "context_after": [row["raw_word"] for row in after],
                     }
                 )
+                if len(hits) >= limit:
+                    break
             return hits
 
     def add_sample(self, **values: Any) -> int:
         values.setdefault("created_at", now())
         values.setdefault("tags", "")
+        values.setdefault("published_path", None)
+        values["tags"] = normalize_tags(values.get("tags") or "")
+        values["speaker"] = normalize_speaker(values.get("speaker"))
         fields = [
             "clip_id",
             "start_word_index",
@@ -242,6 +292,7 @@ class Store:
             "pad_before",
             "pad_after",
             "exported_path",
+            "published_path",
             "speaker",
             "tags",
             "created_at",
@@ -265,14 +316,14 @@ class Store:
             sql = "SELECT * FROM samples WHERE 1=1"
             parameters: list[Any] = []
             if query:
-                sql += " AND text LIKE ?"
-                parameters.append(f"%{query}%")
+                sql += " AND text LIKE ? ESCAPE '\\'"
+                parameters.append(f"%{escape_like(query)}%")
             if speaker:
                 sql += " AND speaker=?"
-                parameters.append(speaker)
+                parameters.append(normalize_speaker(speaker))
             if tag:
-                sql += " AND (',' || tags || ',') LIKE ?"
-                parameters.append(f"%,{tag},%")
+                sql += " AND (',' || tags || ',') LIKE ? ESCAPE '\\'"
+                parameters.append(f"%,{escape_like(tag.strip())},%")
             sql += " ORDER BY created_at DESC"
             rows = database.execute(sql, parameters)
             return [dict(row) for row in rows]
@@ -295,9 +346,12 @@ class Store:
             "pad_before",
             "pad_after",
             "exported_path",
+            "published_path",
             "tags",
         }
         updates = {key: value for key, value in values.items() if key in allowed}
+        if "tags" in updates and updates["tags"] is not None:
+            updates["tags"] = normalize_tags(updates["tags"])
         if not updates:
             return self.sample(sample_id)
         assignments = ", ".join(f"{field}=?" for field in updates)
@@ -311,12 +365,13 @@ class Store:
         return self.sample(sample_id)
 
     def delete_sample(self, sample_id: int) -> bool:
+        sample = self.sample(sample_id)
+        if sample is None:
+            return False
         with self.connect() as database:
-            row = database.execute(
-                "SELECT exported_path FROM samples WHERE id=?", (sample_id,)
-            ).fetchone()
-            if row is None:
-                return False
-            Path(row["exported_path"]).unlink(missing_ok=True)
             database.execute("DELETE FROM samples WHERE id=?", (sample_id,))
-            return True
+        Path(sample["exported_path"]).unlink(missing_ok=True)
+        published = sample.get("published_path")
+        if published:
+            Path(published).unlink(missing_ok=True)
+        return True

@@ -32,5 +32,8 @@ wordbank = "wordbank.cli:main"
 [tool.setuptools.packages.find]
 include = ["wordbank*"]
 
+[tool.setuptools.package-data]
+wordbank = ["static/*"]
+
 [tool.pytest.ini_options]
 testpaths = ["wordbank/tests"]

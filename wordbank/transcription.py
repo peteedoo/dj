@@ -20,24 +20,48 @@ class JSONTranscriber:
         sidecar = audio_path.with_suffix(audio_path.suffix + ".json")
         if not sidecar.exists():
             sidecar = audio_path.with_suffix(".json")
-        data = json.loads(sidecar.read_text())
-        rows = data.get("words", data) if isinstance(data, dict) else data
-        return [
-            Word(
-                clean_word_text(row["text"]),
-                float(row["start"]),
-                float(row["end"]),
-                row.get("confidence"),
+        if not sidecar.exists():
+            raise FileNotFoundError(
+                f"JSON transcriber needs a sidecar next to {audio_path.name}"
             )
-            for row in rows
-        ]
+        data = json.loads(sidecar.read_text())
+        if isinstance(data, dict):
+            if "words" not in data or not isinstance(data["words"], list):
+                raise ValueError("Transcript JSON must contain a 'words' list")
+            rows = data["words"]
+        elif isinstance(data, list):
+            rows = data
+        else:
+            raise ValueError("Transcript JSON must be a list or {words:[...]}")
+        words: list[Word] = []
+        for index, row in enumerate(rows):
+            if not isinstance(row, dict):
+                raise ValueError(f"Word entry {index} must be an object")
+            try:
+                text = clean_word_text(row["text"])
+                start = float(row["start"])
+                end = float(row["end"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError(f"Invalid word entry {index}: {exc}") from exc
+            if end <= start:
+                raise ValueError(
+                    f"Word entry {index} has end <= start ({start}, {end})"
+                )
+            confidence = row.get("confidence")
+            if confidence is not None:
+                confidence = float(confidence)
+            words.append(Word(text, start, end, confidence))
+        return words
 
 
 class FasterWhisperTranscriber:
     def __init__(self, model: str = "small") -> None:
         self.model_name = model
+        self._model = None
 
-    def transcribe(self, audio_path: Path) -> list[Word]:
+    def _load(self):
+        if self._model is not None:
+            return self._model
         try:
             from faster_whisper import WhisperModel
         except ModuleNotFoundError as exc:
@@ -46,7 +70,11 @@ class FasterWhisperTranscriber:
                     "Install wordbank[transcription] to use faster-whisper"
                 ) from exc
             raise
-        model = WhisperModel(self.model_name)
+        self._model = WhisperModel(self.model_name)
+        return self._model
+
+    def transcribe(self, audio_path: Path) -> list[Word]:
+        model = self._load()
         segments, _ = model.transcribe(str(audio_path), word_timestamps=True)
         result: list[Word] = []
         for segment in segments:
@@ -63,11 +91,7 @@ class FasterWhisperTranscriber:
 
 
 class WhisperXTranscriber:
-    """Whisper transcription plus wav2vec2 forced alignment (DJ-grade edges).
-
-    Requires the optional ``alignment`` extra. Heavier than faster-whisper; use
-    when ``small`` word boundaries are too soft on real acapellas.
-    """
+    """Whisper transcription plus wav2vec2 forced alignment (DJ-grade edges)."""
 
     def __init__(
         self,
@@ -83,8 +107,14 @@ class WhisperXTranscriber:
             "int8" if self.device == "cpu" else "float16",
         )
         self.language = language
+        self._model = None
+        self._align_model = None
+        self._align_metadata = None
+        self._align_language = None
 
-    def transcribe(self, audio_path: Path) -> list[Word]:
+    def _load_asr(self):
+        if self._model is not None:
+            return self._model
         try:
             import whisperx
         except ModuleNotFoundError as exc:
@@ -93,20 +123,33 @@ class WhisperXTranscriber:
                     "Install wordbank[alignment] to use WhisperX forced alignment"
                 ) from exc
             raise
-
-        audio = whisperx.load_audio(str(audio_path))
-        model = whisperx.load_model(
+        self._whisperx = whisperx
+        self._model = whisperx.load_model(
             self.model_name,
             self.device,
             compute_type=self.compute_type,
             language=self.language,
         )
-        transcribed = model.transcribe(audio, batch_size=8)
-        language = transcribed.get("language") or self.language
-        align_model, metadata = whisperx.load_align_model(
+        return self._model
+
+    def _load_align(self, language: str):
+        if self._align_model is not None and self._align_language == language:
+            return self._align_model, self._align_metadata
+        whisperx = self._whisperx
+        self._align_model, self._align_metadata = whisperx.load_align_model(
             language_code=language,
             device=self.device,
         )
+        self._align_language = language
+        return self._align_model, self._align_metadata
+
+    def transcribe(self, audio_path: Path) -> list[Word]:
+        model = self._load_asr()
+        whisperx = self._whisperx
+        audio = whisperx.load_audio(str(audio_path))
+        transcribed = model.transcribe(audio, batch_size=8)
+        language = transcribed.get("language") or self.language
+        align_model, metadata = self._load_align(language)
         aligned = whisperx.align(
             transcribed["segments"],
             align_model,
@@ -116,6 +159,7 @@ class WhisperXTranscriber:
             return_char_alignments=False,
         )
         result: list[Word] = []
+        dropped = 0
         for segment in aligned.get("segments", []):
             for word in segment.get("words", []) or []:
                 text = word.get("word") or word.get("text")
@@ -124,6 +168,7 @@ class WhisperXTranscriber:
                 start = word.get("start")
                 end = word.get("end")
                 if start is None or end is None:
+                    dropped += 1
                     continue
                 score = word.get("score", word.get("confidence"))
                 result.append(
@@ -134,6 +179,11 @@ class WhisperXTranscriber:
                         float(score) if score is not None else None,
                     )
                 )
+        if dropped and dropped >= max(3, len(result) // 5):
+            raise RuntimeError(
+                f"WhisperX dropped {dropped} words without timings "
+                f"({len(result)} kept); try re-ingest or another model"
+            )
         return result
 
 

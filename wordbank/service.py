@@ -4,13 +4,14 @@ import shutil
 from pathlib import Path
 from typing import Any, Callable
 
-from .audio import duration, export_slice
+from .audio import AudioToolError, duration, export_slice
 from .export_util import sanitize_label_filename, unique_path
 from .storage import Store
 from .transcription import Transcriber, transcriber_from_env
 from .youtube import (
     DEFAULT_CLIP_SECONDS,
     fetch_youtube_audio,
+    looks_like_youtube,
     resolve_window,
 )
 
@@ -27,6 +28,8 @@ AUDIO_EXTENSIONS = {
     ".ogg",
     ".aac",
 }
+
+MAX_UPLOAD_BYTES = 200 * 1024 * 1024
 
 
 def expanded_label(
@@ -64,12 +67,11 @@ def expanded_label(
 def discover_audio_files(folder: Path) -> list[Path]:
     if not folder.is_dir():
         raise ValueError(f"Not a directory: {folder}")
-    files = [
+    return [
         path
         for path in sorted(folder.iterdir())
         if path.is_file() and path.suffix.lower() in AUDIO_EXTENSIONS
     ]
-    return files
 
 
 def default_data_dir() -> Path:
@@ -81,6 +83,23 @@ def resolve_dir(path: str | Path | None, fallback: Path) -> Path:
     if path is None or path == "":
         return fallback
     return Path(path).expanduser().resolve()
+
+
+def compute_cut(
+    word_start: float,
+    word_end: float,
+    clip_duration: float,
+    pad_before: float,
+    pad_after: float,
+) -> tuple[float, float]:
+    actual_start = max(0.0, word_start + pad_before)
+    actual_end = min(clip_duration, word_end + pad_after)
+    if actual_end <= actual_start:
+        raise ValueError(
+            f"Pads produce an empty cut "
+            f"(start={actual_start:.3f}, end={actual_end:.3f})"
+        )
+    return actual_start, actual_end
 
 
 class WordBank:
@@ -98,36 +117,92 @@ class WordBank:
         configured_export = (
             export_dir if export_dir is not None else os.getenv("WORDBANK_EXPORT_DIR")
         )
-        # Published label-named WAVs land in the same folder as the database
-        # unless WORDBANK_EXPORT_DIR / --export-dir overrides it.
-        self.export_dir = resolve_dir(configured_export, self.store.data_dir)
+        # Published label-named WAVs live in published/ by default so a DJ
+        # watch folder is not pointed at sqlite / temps / hash library cuts.
+        self.export_dir = resolve_dir(
+            configured_export,
+            self.store.data_dir / "published",
+        )
 
+    def _resolve_export_root(
+        self,
+        export_dir: str | Path | None,
+        *,
+        restrict: bool = True,
+    ) -> Path:
+        if export_dir is None or export_dir == "":
+            root = self.export_dir
+        else:
+            root = Path(export_dir).expanduser().resolve()
+            if restrict:
+                try:
+                    root.relative_to(self.export_dir.resolve())
+                except ValueError as exc:
+                    raise ValueError(
+                        f"export_dir must be inside {self.export_dir}"
+                    ) from exc
+        root.mkdir(parents=True, exist_ok=True)
+        return root
+
+    def publish_sample(
+        self,
+        sample_id: int,
+        export_dir: str | Path | None = None,
+        *,
+        restrict: bool = True,
+    ) -> Path:
+        """Copy a sample WAV into the DJ watch folder, named by label."""
+        sample = self.store.sample(sample_id)
+        if sample is None:
+            raise ValueError("Sample not found")
+        destination_root = self._resolve_export_root(export_dir, restrict=restrict)
+        existing = sample.get("published_path")
+        if existing and Path(existing).exists() and export_dir in (None, ""):
+            target = Path(existing)
+            shutil.copy2(sample["exported_path"], target)
+        else:
+            basename = sanitize_label_filename(
+                sample["label"] or sample["text"] or f"sample-{sample_id}"
+            )
+            target = unique_path(destination_root, basename)
+            shutil.copy2(sample["exported_path"], target)
+        self.store.update_sample(sample_id, published_path=str(target))
+        return target
     def ingest(
         self,
         source: Path,
         original_filename: str | None = None,
         speaker: str | None = None,
     ) -> int:
+        suffix = source.suffix.lower()
+        if suffix and suffix not in AUDIO_EXTENSIONS:
+            raise ValueError(f"Unsupported audio extension: {suffix}")
         destination = self.store.audio_dir / (
-            f"{source.stem}-{os.urandom(5).hex()}{source.suffix.lower()}"
+            f"{source.stem}-{os.urandom(5).hex()}{suffix or '.wav'}"
         )
-        shutil.copy2(source, destination)
-        sidecars = (
-            source.with_suffix(".json"),
-            source.with_suffix(source.suffix + ".json"),
-        )
-        for sidecar in sidecars:
-            if sidecar.exists():
-                shutil.copy2(sidecar, destination.with_suffix(".json"))
-                break
-        words = list(self.transcriber.transcribe(destination))
-        return self.store.add_clip(
-            destination,
-            original_filename or source.name,
-            speaker,
-            duration(destination),
-            words,
-        )
+        try:
+            shutil.copy2(source, destination)
+            sidecars = (
+                source.with_suffix(".json"),
+                source.with_suffix(source.suffix + ".json"),
+                Path(str(source) + ".json"),
+            )
+            for sidecar in sidecars:
+                if sidecar.exists():
+                    shutil.copy2(sidecar, destination.with_suffix(".json"))
+                    break
+            words = list(self.transcriber.transcribe(destination))
+            return self.store.add_clip(
+                destination,
+                original_filename or source.name,
+                speaker,
+                duration(destination),
+                words,
+            )
+        except Exception:
+            destination.unlink(missing_ok=True)
+            destination.with_suffix(".json").unlink(missing_ok=True)
+            raise
 
     def ingest_youtube(
         self,
@@ -139,13 +214,15 @@ class WordBank:
         fetcher: Callable[..., dict[str, str | float]] = fetch_youtube_audio,
     ) -> int:
         """Download a YouTube time window (default 30s from start) and ingest it."""
+        if not looks_like_youtube(url):
+            raise ValueError("URL does not look like a YouTube link")
         start_s, end_s = resolve_window(
             start,
             end,
             duration_seconds,
             default_duration=DEFAULT_CLIP_SECONDS,
         )
-        temp = self.store.data_dir / f".youtube-{os.urandom(5).hex()}.wav"
+        temp = self.store.tmp_dir / f"youtube-{os.urandom(5).hex()}.wav"
         try:
             meta = fetcher(url, temp, start_s, end_s)
             return self.ingest(
@@ -161,16 +238,20 @@ class WordBank:
         self,
         folder: Path,
         speaker: str | None = None,
-    ) -> list[dict[str, Any]]:
+    ) -> dict[str, Any]:
         """Ingest every audio file in a folder under one speaker label."""
-        results: list[dict[str, Any]] = []
+        clips: list[dict[str, Any]] = []
+        errors: list[dict[str, str]] = []
         for path in discover_audio_files(folder):
-            clip_id = self.ingest(path, speaker=speaker)
-            clip = self.store.clip(clip_id)
-            if clip is None:
-                raise RuntimeError(f"Ingested clip missing for {path}")
-            results.append(clip)
-        return results
+            try:
+                clip_id = self.ingest(path, speaker=speaker)
+                clip = self.store.clip(clip_id)
+                if clip is None:
+                    raise RuntimeError(f"Ingested clip missing for {path}")
+                clips.append(clip)
+            except Exception as exc:  # noqa: BLE001 - collect per-file errors
+                errors.append({"filename": path.name, "error": str(exc)})
+        return {"clips": clips, "errors": errors, "count": len(clips)}
 
     def make_sample(
         self,
@@ -183,6 +264,8 @@ class WordBank:
         tags: str = "",
         publish: bool = False,
         export_dir: str | Path | None = None,
+        *,
+        restrict_publish: bool = True,
     ) -> dict[str, Any]:
         clip = self.store.clip(clip_id)
         if clip is None or not clip["words"]:
@@ -194,15 +277,24 @@ class WordBank:
         ):
             raise ValueError("Invalid word span")
         words = clip["words"][start_word : end_word + 1]
-        actual_start = max(0.0, words[0]["start"] + pad_before)
-        actual_end = min(clip["duration"], words[-1]["end"] + pad_after)
-        target = self.store.sample_dir / f"sample-{os.urandom(6).hex()}.wav"
-        export_slice(
-            Path(clip["audio_path"]),
-            target,
-            actual_start,
-            actual_end,
+        actual_start, actual_end = compute_cut(
+            words[0]["start"],
+            words[-1]["end"],
+            clip["duration"],
+            pad_before,
+            pad_after,
         )
+        target = self.store.sample_dir / f"sample-{os.urandom(6).hex()}.wav"
+        try:
+            export_slice(
+                Path(clip["audio_path"]),
+                target,
+                actual_start,
+                actual_end,
+            )
+        except (AudioToolError, ValueError):
+            target.unlink(missing_ok=True)
+            raise
         sample_id = self.store.add_sample(
             clip_id=clip_id,
             start_word_index=start_word,
@@ -221,9 +313,17 @@ class WordBank:
         if sample is None:
             raise RuntimeError("Created sample could not be loaded")
         if publish:
-            published = self.publish_sample(sample_id, export_dir)
-            sample = dict(sample)
-            sample["published_path"] = str(published)
+            try:
+                published = self.publish_sample(
+                    sample_id,
+                    export_dir,
+                    restrict=restrict_publish,
+                )
+                sample = dict(sample)
+                sample["published_path"] = str(published)
+            except Exception as exc:  # noqa: BLE001 - sample exists; report publish
+                sample = dict(sample)
+                sample["publish_error"] = str(exc)
         return sample
 
     def expand_sample(
@@ -232,6 +332,8 @@ class WordBank:
         before: int = 0,
         after: int = 0,
     ) -> dict[str, Any]:
+        if before < 0 or after < 0:
+            raise ValueError("before/after must be >= 0")
         sample = self.store.sample(sample_id)
         if sample is None:
             raise ValueError("Sample not found")
@@ -245,6 +347,8 @@ class WordBank:
         )
         added_before = sample["start_word_index"] - start_word
         added_after = end_word - sample["end_word_index"]
+        if added_before == 0 and added_after == 0:
+            return sample
         label = expanded_label(sample["label"], added_before, added_after)
         return self.make_sample(
             sample["clip_id"],
@@ -274,8 +378,13 @@ class WordBank:
         words = clip["words"][
             sample["start_word_index"] : sample["end_word_index"] + 1
         ]
-        actual_start = max(0.0, words[0]["start"] + before)
-        actual_end = min(clip["duration"], words[-1]["end"] + after)
+        actual_start, actual_end = compute_cut(
+            words[0]["start"],
+            words[-1]["end"],
+            clip["duration"],
+            before,
+            after,
+        )
         target = Path(sample["exported_path"])
         export_slice(
             Path(clip["audio_path"]),
@@ -283,6 +392,10 @@ class WordBank:
             actual_start,
             actual_end,
         )
+        published = sample.get("published_path")
+        if published:
+            Path(published).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(target, published)
         updated = self.store.update_sample(
             sample_id,
             start_seconds=actual_start,
@@ -294,37 +407,13 @@ class WordBank:
             raise RuntimeError("Updated sample could not be loaded")
         return updated
 
-    def publish_sample(
-        self,
-        sample_id: int,
-        export_dir: str | Path | None = None,
-    ) -> Path:
-        """Copy a sample WAV into a Serato/Rekordbox-watched folder by label."""
-        sample = self.store.sample(sample_id)
-        if sample is None:
-            raise ValueError("Sample not found")
-        destination_root = (
-            Path(export_dir).expanduser() if export_dir else self.export_dir
-        )
-        destination_root.mkdir(parents=True, exist_ok=True)
-        basename = sanitize_label_filename(
-            sample["label"] or sample["text"] or f"sample-{sample_id}"
-        )
-        target = unique_path(destination_root, basename)
-        shutil.copy2(sample["exported_path"], target)
-        return target
-
     def timing_report(self, clip_id: int) -> dict[str, Any]:
         """Summarize word-edge confidence to judge if alignment is needed."""
         clip = self.store.clip(clip_id)
         if clip is None:
             raise ValueError("Clip not found")
         words = clip["words"]
-        scored = [
-            word
-            for word in words
-            if word.get("confidence") is not None
-        ]
+        scored = [word for word in words if word.get("confidence") is not None]
         gaps = []
         for previous, current in zip(words, words[1:]):
             gap = current["start"] - previous["end"]
@@ -337,10 +426,7 @@ class WordBank:
                         "right": current["raw_word"],
                     }
                 )
-        low = sorted(
-            scored,
-            key=lambda word: word["confidence"],
-        )[:10]
+        low = sorted(scored, key=lambda word: word["confidence"])[:10]
         average = (
             sum(word["confidence"] for word in scored) / len(scored)
             if scored
