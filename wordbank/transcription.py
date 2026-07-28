@@ -28,8 +28,12 @@ class FasterWhisperTranscriber:
     def transcribe(self, audio_path: Path) -> list[Word]:
         try:
             from faster_whisper import WhisperModel
-        except ImportError as exc:
-            raise RuntimeError("Install wordbank[transcription] for faster-whisper") from exc
+        except ModuleNotFoundError as exc:
+            if exc.name == "faster_whisper":
+                raise RuntimeError(
+                    "Install wordbank[transcription] to use faster-whisper"
+                ) from exc
+            raise
         model = WhisperModel(self.model_name)
         segments, _ = model.transcribe(str(audio_path), word_timestamps=True)
         result = []
