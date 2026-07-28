@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools==75.8.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wordbank"
+version = "0.1.0"
+description = "A spoken-word indexer and sample cueing tool for DJs"
+requires-python = ">=3.10"
+dependencies = [
+  "fastapi==0.115.8",
+  "python-multipart==0.0.20",
+  "uvicorn==0.34.0",
+]
+
+[project.optional-dependencies]
+transcription = ["faster-whisper==1.1.1"]
+test = ["httpx==0.28.1", "pytest==8.3.4"]
+
+[project.scripts]
+wordbank = "wordbank.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["wordbank*"]
+
+[tool.pytest.ini_options]
+testpaths = ["wordbank/tests"]

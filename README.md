@@ -9,6 +9,7 @@ sync/     NAS → SSD copy script + launchd agent
 crates/   Crate definitions and track notes
 sets/     Setlist logs
 tools/    Utility scripts (BPM helpers, playlist exporters, etc.)
+wordbank/ Spoken-word indexer, cue search, and sample library
 ```
 
 ## Setup
@@ -41,3 +42,9 @@ See `crates/` — one file per crate. Format is freeform but track → notes wor
 ## Sets
 
 See `sets/` — one file per set or session. Date-named (`2026-05-20-practice.md`).
+
+## Wordbank
+
+`wordbank/` is a local FastAPI DJ utility for turning short spoken clips into
+searchable, timestamped words and exported WAV samples. See
+[`wordbank/README.md`](wordbank/README.md) for setup and API details.
