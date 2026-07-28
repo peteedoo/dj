@@ -286,6 +286,30 @@ class Store:
                 return None
             return dict(row)
 
+    def update_sample(self, sample_id: int, **values: Any) -> dict[str, Any] | None:
+        allowed = {
+            "label",
+            "text",
+            "start_seconds",
+            "end_seconds",
+            "pad_before",
+            "pad_after",
+            "exported_path",
+            "tags",
+        }
+        updates = {key: value for key, value in values.items() if key in allowed}
+        if not updates:
+            return self.sample(sample_id)
+        assignments = ", ".join(f"{field}=?" for field in updates)
+        with self.connect() as database:
+            cursor = database.execute(
+                f"UPDATE samples SET {assignments} WHERE id=?",
+                [*updates.values(), sample_id],
+            )
+            if cursor.rowcount == 0:
+                return None
+        return self.sample(sample_id)
+
     def delete_sample(self, sample_id: int) -> bool:
         with self.connect() as database:
             row = database.execute(

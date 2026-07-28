@@ -20,6 +20,7 @@
       padding: .5rem;
     }
     button { cursor: pointer; }
+    button:disabled { opacity: .45; cursor: default; }
     .word {
       cursor: pointer;
       display: inline-block;
@@ -32,35 +33,77 @@
     .sample-row { border-top: 1px solid #30363b; padding: .75rem 0; }
     .samples audio { width: 220px; }
     .muted { color: #89929b; }
+    .hit {
+      border-left: 3px solid transparent;
+      cursor: pointer;
+      margin: .35rem 0;
+      padding: .35rem .5rem;
+    }
+    .hit.active {
+      background: #242a31;
+      border-left-color: #c77dff;
+    }
+    .hit button { margin-right: .5rem; }
+    #waveform-wrap {
+      margin: 1rem 0;
+      position: relative;
+      user-select: none;
+    }
+    #waveform {
+      background: #0c0e10;
+      display: block;
+      height: 96px;
+      width: 100%;
+    }
+    .keys { font-size: 12px; margin-top: .5rem; }
+    .row { align-items: center; display: flex; flex-wrap: wrap; gap: .5rem; }
   </style>
 </head>
 <body>
   <h1>WORD<span style="color:#c77dff">BANK</span></h1>
   <section class="panel">
-    <input type="file" id="file" accept="audio/*">
-    <input id="speaker" placeholder="speaker">
-    <button id="upload">INGEST</button>
-    <span id="status" class="muted"></span>
+    <div class="row">
+      <input type="file" id="file" accept="audio/*" multiple>
+      <input id="speaker" placeholder="speaker label (typed, not diarized)">
+      <button id="upload">INGEST</button>
+      <button id="upload-batch">BATCH INGEST</button>
+      <span id="status" class="muted"></span>
+    </div>
+    <p class="muted keys">Speaker is a label you type at upload — not automatic diarization.</p>
   </section>
   <section class="panel">
-    <input id="query" placeholder="search words or phrases">
-    <input id="filter" placeholder="speaker">
-    <input id="search-limit" type="number" min="1" value="50">
-    <button id="search">SEARCH</button>
+    <div class="row">
+      <input id="query" placeholder="search words or phrases">
+      <input id="filter" placeholder="speaker">
+      <input id="search-limit" type="number" min="1" value="50">
+      <button id="search">SEARCH</button>
+    </div>
+    <p class="muted keys">
+      Keyboard: ↑/↓ or j/k select hit · Enter/Space preview · ←/→ nudge selection · Esc clear
+    </p>
     <div id="results"></div>
   </section>
   <section class="panel">
     <h2 id="cliptitle">Transcript</h2>
     <audio id="player" controls></audio>
+    <div id="waveform-wrap">
+      <canvas id="waveform" height="96"></canvas>
+    </div>
     <div id="transcript"></div>
-    <label>Before <input id="before" type="number" step=".01" value="-.08"></label>
-    <label>After <input id="after" type="number" step=".01" value=".12"></label>
-    <input id="sample-label" placeholder="sample label">
-    <input id="sample-tags" placeholder="tags,comma,separated">
-    <button id="make-sample">MAKE SAMPLE</button>
+    <div class="row" style="margin-top:1rem">
+      <label>Before <input id="before" type="number" step=".01" value="-.08"></label>
+      <label>After <input id="after" type="number" step=".01" value=".12"></label>
+      <input id="sample-label" placeholder="sample label">
+      <input id="sample-tags" placeholder="tags,comma,separated">
+      <label><input id="publish-on-make" type="checkbox"> publish to DJ folder</label>
+      <button id="make-sample">MAKE SAMPLE</button>
+      <button id="timing-btn">TIMING REPORT</button>
+    </div>
+    <pre id="timing" class="muted" style="white-space:pre-wrap"></pre>
   </section>
   <section class="panel samples">
     <h2>Sample library</h2>
+    <p class="muted keys">Export folder: <span id="export-dir">…</span></p>
     <div id="library"></div>
   </section>
   <script>
@@ -68,6 +111,11 @@
     let selected = [];
     let selectionAnchor = null;
     let dragging = false;
+    let hits = [];
+    let hitIndex = -1;
+    let waveformPeaks = null;
+    let waveformDrag = null;
+    let audioContext = null;
 
     const element = (id) => document.getElementById(id);
 
@@ -80,11 +128,31 @@
           index >= selected[0] && index <= selected[1],
         );
       });
+      drawWaveform();
     }
 
     function cueWord(index) {
       element("player").currentTime = clip.words[index].start;
       element("player").play();
+    }
+
+    function selectionSpan() {
+      if (!clip || selected.length === 0) {
+        return null;
+      }
+      const words = clip.words;
+      const padBefore = Number(element("before").value);
+      const padAfter = Number(element("after").value);
+      const wordStart = words[selected[0]].start;
+      const wordEnd = words[selected[1]].end;
+      return {
+        wordStart,
+        wordEnd,
+        start: Math.max(0, wordStart + padBefore),
+        end: Math.min(clip.duration, wordEnd + padAfter),
+        padBefore,
+        padAfter,
+      };
     }
 
     function renderTranscript() {
@@ -111,11 +179,133 @@
         });
         transcript.appendChild(wordElement);
       });
+      loadWaveform(clip.id);
+      element("timing").textContent = "";
+    }
+
+    async function loadWaveform(clipId) {
+      waveformPeaks = null;
+      drawWaveform();
+      try {
+        const response = await fetch(`/clips/${clipId}/audio`);
+        const buffer = await response.arrayBuffer();
+        audioContext = audioContext || new AudioContext();
+        const decoded = await audioContext.decodeAudioData(buffer.slice(0));
+        const channel = decoded.getChannelData(0);
+        const buckets = 800;
+        const peaks = new Float32Array(buckets);
+        const block = Math.max(1, Math.floor(channel.length / buckets));
+        for (let i = 0; i < buckets; i += 1) {
+          let peak = 0;
+          const offset = i * block;
+          for (let j = 0; j < block && offset + j < channel.length; j += 1) {
+            peak = Math.max(peak, Math.abs(channel[offset + j]));
+          }
+          peaks[i] = peak;
+        }
+        waveformPeaks = peaks;
+        drawWaveform();
+      } catch (error) {
+        element("status").textContent = ` waveform unavailable: ${error.message}`;
+      }
+    }
+
+    function drawWaveform() {
+      const canvas = element("waveform");
+      const ratio = window.devicePixelRatio || 1;
+      const width = canvas.clientWidth || canvas.parentElement.clientWidth || 800;
+      const height = 96;
+      canvas.width = Math.floor(width * ratio);
+      canvas.height = Math.floor(height * ratio);
+      canvas.style.width = `${width}px`;
+      canvas.style.height = `${height}px`;
+      const ctx = canvas.getContext("2d");
+      ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+      ctx.fillStyle = "#0c0e10";
+      ctx.fillRect(0, 0, width, height);
+      if (!clip) {
+        return;
+      }
+      if (waveformPeaks) {
+        ctx.fillStyle = "#4b5560";
+        const mid = height / 2;
+        for (let i = 0; i < waveformPeaks.length; i += 1) {
+          const x = (i / waveformPeaks.length) * width;
+          const amp = waveformPeaks[i] * (height * 0.45);
+          ctx.fillRect(x, mid - amp, Math.max(1, width / waveformPeaks.length), amp * 2);
+        }
+      }
+      const span = selectionSpan();
+      if (!span) {
+        return;
+      }
+      const xWord0 = (span.wordStart / clip.duration) * width;
+      const xWord1 = (span.wordEnd / clip.duration) * width;
+      const x0 = (span.start / clip.duration) * width;
+      const x1 = (span.end / clip.duration) * width;
+      ctx.fillStyle = "rgba(199, 125, 255, 0.18)";
+      ctx.fillRect(x0, 0, Math.max(1, x1 - x0), height);
+      ctx.fillStyle = "rgba(199, 125, 255, 0.35)";
+      ctx.fillRect(xWord0, 0, Math.max(1, xWord1 - xWord0), height);
+      ctx.fillStyle = "#c77dff";
+      ctx.fillRect(x0 - 2, 0, 4, height);
+      ctx.fillRect(x1 - 2, 0, 4, height);
+      ctx.fillStyle = "#89b4fa";
+      ctx.fillRect(xWord0 - 1, 0, 2, height);
+      ctx.fillRect(xWord1 - 1, 0, 2, height);
+    }
+
+    function waveformTimeAt(clientX) {
+      const canvas = element("waveform");
+      const rect = canvas.getBoundingClientRect();
+      const ratio = Math.min(1, Math.max(0, (clientX - rect.left) / rect.width));
+      return ratio * clip.duration;
+    }
+
+    function beginWaveformDrag(event) {
+      if (!clip || selected.length === 0) {
+        return;
+      }
+      const span = selectionSpan();
+      const time = waveformTimeAt(event.clientX);
+      const distStart = Math.abs(time - span.start);
+      const distEnd = Math.abs(time - span.end);
+      waveformDrag = distStart <= distEnd ? "before" : "after";
+      updatePadFromWaveform(time);
+      element("waveform").setPointerCapture(event.pointerId);
+    }
+
+    function updatePadFromWaveform(time) {
+      if (!waveformDrag || selected.length === 0) {
+        return;
+      }
+      const words = clip.words;
+      const wordStart = words[selected[0]].start;
+      const wordEnd = words[selected[1]].end;
+      if (waveformDrag === "before") {
+        const pad = Math.min(0, Math.max(-wordStart, time - wordStart));
+        element("before").value = pad.toFixed(3);
+      } else {
+        const pad = Math.max(0, Math.min(clip.duration - wordEnd, time - wordEnd));
+        element("after").value = pad.toFixed(3);
+      }
+      drawWaveform();
     }
 
     document.addEventListener("pointerup", () => {
       dragging = false;
+      waveformDrag = null;
     });
+
+    element("waveform").addEventListener("pointerdown", beginWaveformDrag);
+    element("waveform").addEventListener("pointermove", (event) => {
+      if (waveformDrag) {
+        updatePadFromWaveform(waveformTimeAt(event.clientX));
+      }
+    });
+    element("before").addEventListener("input", drawWaveform);
+    element("after").addEventListener("input", drawWaveform);
+    window.addEventListener("resize", drawWaveform);
 
     async function uploadClip() {
       const file = element("file").files[0];
@@ -140,6 +330,64 @@
       element("status").textContent = " ready";
     }
 
+    async function uploadBatch() {
+      const files = Array.from(element("file").files || []);
+      if (files.length === 0) {
+        return;
+      }
+      const form = new FormData();
+      files.forEach((file) => form.append("files", file));
+      if (element("speaker").value) {
+        form.append("speaker", element("speaker").value);
+      }
+      element("status").textContent = ` batch indexing ${files.length}…`;
+      const response = await fetch("/clips/batch", { method: "POST", body: form });
+      if (!response.ok) {
+        element("status").textContent = " batch failed";
+        return;
+      }
+      const data = await response.json();
+      if (data.clips.length) {
+        clip = data.clips[data.clips.length - 1];
+        selected = [];
+        renderTranscript();
+      }
+      await refreshSamples();
+      const errNote = data.errors.length ? ` (${data.errors.length} errors)` : "";
+      element("status").textContent = ` batch ready: ${data.count} clips${errNote}`;
+    }
+
+    function renderHits() {
+      element("results").innerHTML = "";
+      hits.forEach((hit, index) => {
+        const row = document.createElement("div");
+        row.className = `hit${index === hitIndex ? " active" : ""}`;
+        row.dataset.index = index;
+        const button = document.createElement("button");
+        button.textContent = hit.text;
+        button.addEventListener("click", () => {
+          hitIndex = index;
+          renderHits();
+          loadClip(hit);
+        });
+        row.appendChild(button);
+        row.append(
+          document.createTextNode(
+            ` ${hit.speaker || ""} @ ${hit.start.toFixed(2)}s · ${hit.filename || ""}`,
+          ),
+        );
+        row.addEventListener("click", (event) => {
+          if (event.target === button) {
+            return;
+          }
+          hitIndex = index;
+          renderHits();
+          loadClip(hit);
+        });
+        element("results").appendChild(row);
+      });
+    }
+
     async function searchClips() {
       const parameters = new URLSearchParams({
         q: element("query").value,
@@ -151,16 +399,12 @@
       }
       const response = await fetch(`/search?${parameters}`);
       const data = await response.json();
-      element("results").innerHTML = "";
-      data.hits.forEach((hit) => {
-        const row = document.createElement("p");
-        const button = document.createElement("button");
-        button.textContent = hit.text;
-        button.addEventListener("click", () => loadClip(hit));
-        row.appendChild(button);
-        row.append(` ${hit.speaker || ""} @ ${hit.start.toFixed(2)}s`);
-        element("results").appendChild(row);
-      });
+      hits = data.hits;
+      hitIndex = hits.length ? 0 : -1;
+      renderHits();
+      if (hitIndex >= 0) {
+        await loadClip(hits[hitIndex]);
+      }
     }
 
     async function loadClip(hit) {
@@ -187,9 +431,19 @@
           tags: element("sample-tags").value,
           pad_before: Number(element("before").value),
           pad_after: Number(element("after").value),
+          publish: element("publish-on-make").checked,
         }),
       });
       await refreshSamples();
+    }
+
+    async function showTiming() {
+      if (!clip) {
+        return;
+      }
+      const response = await fetch(`/clips/${clip.id}/timing`);
+      const report = await response.json();
+      element("timing").textContent = JSON.stringify(report, null, 2);
     }
 
     async function expandSample(sampleId) {
@@ -207,6 +461,16 @@
       await refreshSamples();
     }
 
+    async function publishSample(sampleId) {
+      const response = await fetch(`/samples/${sampleId}/publish`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: "{}",
+      });
+      const data = await response.json();
+      element("status").textContent = ` published → ${data.published_path}`;
+    }
+
     async function refreshSamples() {
       const response = await fetch("/samples");
       const samples = await response.json();
@@ -217,22 +481,97 @@
         row.innerHTML = `
           <strong>${sample.label || sample.text}</strong>
           <span class="muted">${sample.speaker || ""}</span>
-          <audio controls src="/samples/${sample.id}/audio"></audio>
-          <a href="/samples/${sample.id}/audio" download>download</a>
+          <audio controls src="/samples/${sample.id}/audio?ts=${Date.now()}"></audio>
+          <a href="/samples/${sample.id}/audio" download="${(sample.label || sample.text || "sample").replaceAll(" ", "_")}.wav">download</a>
           <label>before <input data-before="${sample.id}" type="number" value="0" min="0"></label>
           <label>after <input data-after="${sample.id}" type="number" value="0" min="0"></label>
         `;
-        const button = document.createElement("button");
-        button.textContent = "EXPAND";
-        button.addEventListener("click", () => expandSample(sample.id));
-        row.appendChild(button);
+        const expand = document.createElement("button");
+        expand.textContent = "EXPAND";
+        expand.addEventListener("click", () => expandSample(sample.id));
+        const publish = document.createElement("button");
+        publish.textContent = "PUBLISH";
+        publish.title = "Copy into DJ watch folder, named by label";
+        publish.addEventListener("click", () => publishSample(sample.id));
+        row.appendChild(expand);
+        row.appendChild(publish);
         element("library").appendChild(row);
       });
     }
 
+    function typingTarget(event) {
+      const tag = (event.target && event.target.tagName) || "";
+      return tag === "INPUT" || tag === "TEXTAREA" || event.target.isContentEditable;
+    }
+
+    async function onKeydown(event) {
+      if (typingTarget(event)) {
+        return;
+      }
+      if (event.key === "Escape") {
+        hitIndex = -1;
+        renderHits();
+        return;
+      }
+      if (!hits.length) {
+        if (clip && selected.length && (event.key === "ArrowLeft" || event.key === "ArrowRight")) {
+          event.preventDefault();
+          const width = selected[1] - selected[0];
+          const delta = event.key === "ArrowLeft" ? -1 : 1;
+          const next = Math.min(
+            clip.words.length - 1 - width,
+            Math.max(0, selected[0] + delta),
+          );
+          setSelection(next, next + width);
+          cueWord(selected[0]);
+        }
+        return;
+      }
+      if (event.key === "ArrowDown" || event.key === "j") {
+        event.preventDefault();
+        hitIndex = Math.min(hits.length - 1, hitIndex + 1);
+        renderHits();
+        await loadClip(hits[hitIndex]);
+      } else if (event.key === "ArrowUp" || event.key === "k") {
+        event.preventDefault();
+        hitIndex = Math.max(0, hitIndex - 1);
+        renderHits();
+        await loadClip(hits[hitIndex]);
+      } else if (event.key === "Enter" || event.key === " ") {
+        event.preventDefault();
+        if (hitIndex >= 0) {
+          cueWord(hits[hitIndex].word_start);
+        }
+      } else if (event.key === "ArrowLeft" || event.key === "ArrowRight") {
+        if (!clip || selected.length === 0) {
+          return;
+        }
+        event.preventDefault();
+        const delta = event.key === "ArrowLeft" ? -1 : 1;
+        const width = selected[1] - selected[0];
+        const next = Math.min(
+          clip.words.length - 1 - width,
+          Math.max(0, selected[0] + delta),
+        );
+        setSelection(next, next + width);
+        cueWord(selected[0]);
+      }
+    }
+
+    document.addEventListener("keydown", onKeydown);
     element("upload").addEventListener("click", uploadClip);
+    element("upload-batch").addEventListener("click", uploadBatch);
     element("search").addEventListener("click", searchClips);
     element("make-sample").addEventListener("click", makeSample);
+    element("timing-btn").addEventListener("click", showTiming);
+
+    async function loadSettings() {
+      const response = await fetch("/settings");
+      const data = await response.json();
+      element("export-dir").textContent = data.export_dir;
+    }
+
+    loadSettings();
     refreshSamples();
   </script>
 </body>

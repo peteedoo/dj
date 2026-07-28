@@ -8,10 +8,13 @@ from fastapi.testclient import TestClient
 
 from wordbank.api import create_app
 from wordbank import cli
-from wordbank.service import WordBank
+from wordbank.export_util import sanitize_label_filename, unique_path
+from wordbank.service import WordBank, discover_audio_files
 from wordbank.transcription import (
     FasterWhisperTranscriber,
     JSONTranscriber,
+    WhisperXTranscriber,
+    clean_word_text,
     transcriber_from_env,
 )
 
@@ -19,13 +22,34 @@ from wordbank.transcription import (
 @pytest.fixture
 def clip_file(tmp_path):
     audio = tmp_path / "voice.wav"
-    subprocess.run(["ffmpeg", "-y", "-f", "lavfi", "-i", "sine=frequency=440:duration=2",
-                    "-ac", "1", "-ar", "16000", str(audio)], capture_output=True, check=True)
-    (tmp_path / "voice.json").write_text(json.dumps({"words": [
-        {"text": "Hello,", "start": 0.05, "end": 0.35, "confidence": .9},
-        {"text": "world", "start": 0.45, "end": 0.8, "confidence": .9},
-        {"text": "hello", "start": 1.1, "end": 1.4, "confidence": .8},
-    ]}))
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:duration=2",
+            "-ac",
+            "1",
+            "-ar",
+            "16000",
+            str(audio),
+        ],
+        capture_output=True,
+        check=True,
+    )
+    (tmp_path / "voice.json").write_text(
+        json.dumps(
+            {
+                "words": [
+                    {"text": "Hello,", "start": 0.05, "end": 0.35, "confidence": 0.9},
+                    {"text": "world", "start": 0.45, "end": 0.8, "confidence": 0.9},
+                    {"text": "hello", "start": 1.1, "end": 1.4, "confidence": 0.8},
+                ]
+            }
+        )
+    )
     return audio
 
 
@@ -84,20 +108,54 @@ def test_transcriber_selection(monkeypatch):
     assert isinstance(transcriber_from_env(), JSONTranscriber)
     monkeypatch.setenv("WORDBANK_TRANSCRIBER", "whisper")
     assert isinstance(transcriber_from_env(), FasterWhisperTranscriber)
+    monkeypatch.setenv("WORDBANK_TRANSCRIBER", "whisperx")
+    assert isinstance(transcriber_from_env(), WhisperXTranscriber)
     monkeypatch.setenv("WORDBANK_TRANSCRIBER", "other")
     with pytest.raises(ValueError, match="Unknown"):
         transcriber_from_env()
+
+
+def test_clean_word_text_strips_whisper_spaces():
+    assert clean_word_text(" Make") == "Make"
+    assert clean_word_text(" noise. ") == "noise."
+
+
+def test_whisperx_missing_dependency_message(monkeypatch):
+    import builtins
+
+    real_import = builtins.__import__
+
+    def fake_import(name, *args, **kwargs):
+        if name == "whisperx" or name.startswith("whisperx."):
+            raise ModuleNotFoundError("No module named 'whisperx'", name="whisperx")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+    with pytest.raises(RuntimeError, match="wordbank\\[alignment\\]"):
+        WhisperXTranscriber().transcribe(Path("missing.wav"))
 
 
 def test_export_padding_clamp_duration_and_expand(bank, clip_file):
     clip_id = bank.ingest(clip_file, speaker="Ada")
     sample = bank.make_sample(clip_id, 0, 0, pad_before=-2, pad_after=2)
     assert sample["start_seconds"] == 0
-    assert sample["end_seconds"] == pytest.approx(2, abs=.05)
-    probe = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration",
-                            "-of", "default=noprint_wrappers=1:nokey=1", sample["exported_path"]],
-                           capture_output=True, text=True, check=True)
-    assert float(probe.stdout) == pytest.approx(2, abs=.08)
+    assert sample["end_seconds"] == pytest.approx(2, abs=0.05)
+    probe = subprocess.run(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            sample["exported_path"],
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert float(probe.stdout) == pytest.approx(2, abs=0.08)
     expanded = bank.expand_sample(sample["id"], after=2)
     assert expanded["end_word_index"] == 2
     assert expanded["label"] == "Hello, (expanded +2 after)"
@@ -145,6 +203,9 @@ def test_module_help_uses_cli_parser():
     assert result.returncode == 0
     assert "usage: wordbank" in result.stdout
     assert "serve" in result.stdout
+    assert "ingest-batch" in result.stdout
+    assert "publish" in result.stdout
+    assert "timing" in result.stdout
 
 
 def test_api_routes(tmp_path, clip_file):
@@ -152,19 +213,29 @@ def test_api_routes(tmp_path, clip_file):
     client = TestClient(create_app(bank))
     assert client.get("/health").json() == {"status": "ok"}
     with clip_file.open("rb") as fh:
-        transcript = json.dumps({"words": [
-            {"text": "Hello,", "start": .05, "end": .35},
-            {"text": "world", "start": .45, "end": .8},
-            {"text": "hello", "start": 1.1, "end": 1.4},
-        ]})
-        response = client.post("/clips", files={"file": ("clip.wav", fh, "audio/wav")},
-                               data={"speaker": "Ada", "transcript": transcript})
+        transcript = json.dumps(
+            {
+                "words": [
+                    {"text": "Hello,", "start": 0.05, "end": 0.35},
+                    {"text": "world", "start": 0.45, "end": 0.8},
+                    {"text": "hello", "start": 1.1, "end": 1.4},
+                ]
+            }
+        )
+        response = client.post(
+            "/clips",
+            files={"file": ("clip.wav", fh, "audio/wav")},
+            data={"speaker": "Ada", "transcript": transcript},
+        )
     assert response.status_code == 200
     clip = response.json()
     assert len(client.get(f"/clips/{clip['id']}").json()["words"]) == 3
-    assert client.get(
-        "/search?q=hello+world&speaker=Ada&limit=1"
-    ).json()["hits"][0]["start"] == .05
+    assert (
+        client.get("/search?q=hello+world&speaker=Ada&limit=1").json()["hits"][0][
+            "start"
+        ]
+        == 0.05
+    )
     sample = client.post(
         "/samples",
         json={
@@ -177,10 +248,21 @@ def test_api_routes(tmp_path, clip_file):
     assert client.get("/samples?tag=blue").json()[0]["id"] == sample["id"]
     assert client.get("/samples?speaker=Ada").json()[0]["id"] == sample["id"]
     assert client.get(f"/samples/{sample['id']}/audio").status_code == 200
+    timing = client.get(f"/clips/{clip['id']}/timing").json()
+    assert timing["word_count"] == 3
+    assert "whisperx" in timing["hint"]
+    published = client.post(f"/samples/{sample['id']}/publish", json={}).json()
+    assert Path(published["published_path"]).exists()
+    recut = client.post(
+        f"/samples/{sample['id']}/recut",
+        json={"pad_before": -0.02, "pad_after": 0.05},
+    ).json()
+    assert recut["pad_before"] == pytest.approx(-0.02)
     assert client.delete(f"/samples/{sample['id']}").json() == {"deleted": True}
     assert client.get("/clips/999").status_code == 404
     assert client.get("/samples/999/audio").status_code == 404
     assert client.delete("/samples/999").status_code == 404
+    assert client.get("/settings").json()["export_dir"].endswith("dj-export")
 
 
 def test_cli_serve_uses_data_dir(monkeypatch, tmp_path):
@@ -215,3 +297,96 @@ def test_cli_serve_uses_data_dir(monkeypatch, tmp_path):
 
     assert captured["bank"].store.data_dir == tmp_path / "custom"
     assert captured["run"] == ("app", "0.0.0.0", 9123)
+
+
+def test_batch_ingest_folder(tmp_path, clip_file):
+    folder = tmp_path / "batch"
+    folder.mkdir()
+    for name in ("a.wav", "b.wav"):
+        target = folder / name
+        target.write_bytes(clip_file.read_bytes())
+        (folder / f"{Path(name).stem}.json").write_text(
+            (clip_file.with_suffix(".json")).read_text()
+        )
+    bank = WordBank(tmp_path / "data", JSONTranscriber())
+    clips = bank.ingest_batch(folder, speaker="MC")
+    assert len(clips) == 2
+    assert all(clip["speaker"] == "MC" for clip in clips)
+    assert discover_audio_files(folder)[0].name == "a.wav"
+
+
+def test_api_batch_upload(tmp_path, clip_file):
+    from wordbank.models import Word
+
+    class StubTranscriber:
+        def transcribe(self, audio_path):
+            return [
+                Word("make", 0.05, 0.3, 0.9),
+                Word("noise", 0.4, 0.7, 0.9),
+            ]
+
+    bank = WordBank(tmp_path / "data", StubTranscriber())
+    client = TestClient(create_app(bank))
+    with clip_file.open("rb") as one, clip_file.open("rb") as two:
+        response = client.post(
+            "/clips/batch",
+            files=[
+                ("files", ("one.wav", one, "audio/wav")),
+                ("files", ("two.wav", two, "audio/wav")),
+            ],
+            data={"speaker": "Crowd"},
+        )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["count"] == 2
+    assert payload["errors"] == []
+    assert payload["clips"][0]["speaker"] == "Crowd"
+    assert payload["clips"][0]["transcript"] == "make noise"
+
+
+def test_publish_and_recut_preserve_word_indices(bank, clip_file, tmp_path):
+    clip_id = bank.ingest(clip_file, speaker="Ada")
+    sample = bank.make_sample(clip_id, 0, 1, label="make some noise")
+    dest = tmp_path / "serato-watch"
+    published = bank.publish_sample(sample["id"], dest)
+    assert published.parent == dest
+    assert published.name == "make_some_noise.wav"
+    assert published.exists()
+
+    again = bank.publish_sample(sample["id"], dest)
+    assert again.name == "make_some_noise_2.wav"
+
+    recut = bank.recut_sample(sample["id"], pad_before=-0.01, pad_after=0.2)
+    assert recut["id"] == sample["id"]
+    assert recut["start_word_index"] == 0
+    assert recut["end_word_index"] == 1
+    assert recut["pad_before"] == pytest.approx(-0.01)
+    assert recut["pad_after"] == pytest.approx(0.2)
+
+    published_on_make = bank.make_sample(
+        clip_id,
+        2,
+        2,
+        label="hello",
+        publish=True,
+        export_dir=dest,
+    )
+    assert Path(published_on_make["published_path"]).exists()
+
+
+def test_timing_report_flags_gaps(bank, clip_file):
+    clip_id = bank.ingest(clip_file, speaker="Ada")
+    report = bank.timing_report(clip_id)
+    assert report["word_count"] == 3
+    assert report["average_confidence"] == pytest.approx(0.866666, abs=0.01)
+    assert any(gap["gap"] > 0.2 for gap in report["suspicious_gaps"])
+
+
+def test_sanitize_label_filename(tmp_path):
+    assert sanitize_label_filename("Make some noise!") == "Make_some_noise!"
+    assert sanitize_label_filename("a/b:c") == "abc"
+    assert sanitize_label_filename("   ") == "sample"
+    path = unique_path(tmp_path, "x")
+    assert path == tmp_path / "x.wav"
+    path.write_text("a")
+    assert unique_path(tmp_path, "x").name == "x_2.wav"

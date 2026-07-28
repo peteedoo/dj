@@ -4,7 +4,7 @@ from typing import Any
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse
 
-from .service import WordBank
+from .service import AUDIO_EXTENSIONS, WordBank
 
 
 def create_app(bank: WordBank | None = None) -> FastAPI:
@@ -33,6 +33,29 @@ def create_app(bank: WordBank | None = None) -> FastAPI:
             temp.unlink(missing_ok=True)
             temp.with_suffix(".json").unlink(missing_ok=True)
 
+    @app.post("/clips/batch")
+    async def upload_batch(
+        files: list[UploadFile] = File(...),
+        speaker: str | None = Form(None),
+    ) -> dict[str, Any]:
+        clips: list[dict[str, Any]] = []
+        errors: list[dict[str, str]] = []
+        for upload in files:
+            safe_name = Path(upload.filename or "clip").name
+            temp = wordbank.store.data_dir / f".upload-batch-{safe_name}"
+            try:
+                temp.write_bytes(await upload.read())
+                clip_id = wordbank.ingest(temp, upload.filename, speaker)
+                clip = wordbank.store.clip(clip_id)
+                if clip is not None:
+                    clips.append(clip)
+            except Exception as exc:  # noqa: BLE001 - report per-file failure
+                errors.append({"filename": safe_name, "error": str(exc)})
+            finally:
+                temp.unlink(missing_ok=True)
+                temp.with_suffix(".json").unlink(missing_ok=True)
+        return {"clips": clips, "errors": errors, "count": len(clips)}
+
     @app.get("/clips")
     def list_clips() -> list[dict[str, Any]]:
         return wordbank.store.clips()
@@ -50,6 +73,13 @@ def create_app(bank: WordBank | None = None) -> FastAPI:
         if clip is None:
             raise HTTPException(404, "Clip not found")
         return FileResponse(clip["audio_path"])
+
+    @app.get("/clips/{clip_id}/timing")
+    def clip_timing(clip_id: int) -> dict[str, Any]:
+        try:
+            return wordbank.timing_report(clip_id)
+        except ValueError as exc:
+            raise HTTPException(404, str(exc)) from exc
 
     @app.get("/search")
     def search(
@@ -73,6 +103,8 @@ def create_app(bank: WordBank | None = None) -> FastAPI:
                 float(payload.get("pad_before", -0.08)),
                 float(payload.get("pad_after", 0.12)),
                 payload.get("tags", ""),
+                bool(payload.get("publish", False)),
+                payload.get("export_dir"),
             )
         except (KeyError, ValueError) as exc:
             raise HTTPException(400, str(exc)) from exc
@@ -90,6 +122,37 @@ def create_app(bank: WordBank | None = None) -> FastAPI:
             )
         except ValueError as exc:
             raise HTTPException(404, str(exc)) from exc
+
+    @app.post("/samples/{sample_id}/recut")
+    def recut_sample(
+        sample_id: int,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        try:
+            pad_before = payload.get("pad_before")
+            pad_after = payload.get("pad_after")
+            return wordbank.recut_sample(
+                sample_id,
+                float(pad_before) if pad_before is not None else None,
+                float(pad_after) if pad_after is not None else None,
+            )
+        except ValueError as exc:
+            raise HTTPException(404, str(exc)) from exc
+
+    @app.post("/samples/{sample_id}/publish")
+    def publish_sample(
+        sample_id: int,
+        payload: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        payload = payload or {}
+        try:
+            path = wordbank.publish_sample(
+                sample_id,
+                payload.get("export_dir"),
+            )
+        except ValueError as exc:
+            raise HTTPException(404, str(exc)) from exc
+        return {"published_path": str(path)}
 
     @app.get("/samples")
     def list_samples(
@@ -111,6 +174,16 @@ def create_app(bank: WordBank | None = None) -> FastAPI:
         if not wordbank.store.delete_sample(sample_id):
             raise HTTPException(404, "Sample not found")
         return {"deleted": True}
+
+    @app.get("/settings")
+    def settings() -> dict[str, Any]:
+        return {
+            "export_dir": str(wordbank.export_dir),
+            "data_dir": str(wordbank.store.data_dir),
+            "audio_extensions": sorted(
+                extension.lstrip(".") for extension in AUDIO_EXTENSIONS
+            ),
+        }
 
     @app.get("/", response_class=HTMLResponse)
     def index() -> str:
