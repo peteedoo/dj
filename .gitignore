@@ -1,2 +1,9 @@
 .DS_Store
 *.log
+wordbank/data/
+wordbank/*.wav
+wordbank/**/*.wav
+*.sqlite3
+.venv/
+*.egg-info/
+__pycache__/
