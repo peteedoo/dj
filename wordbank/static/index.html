@@ -20,6 +20,7 @@
       padding: .5rem;
     }
     button { cursor: pointer; }
+    button:disabled { opacity: .45; cursor: default; }
     .word {
       cursor: pointer;
       display: inline-block;
@@ -32,35 +33,87 @@
     .sample-row { border-top: 1px solid #30363b; padding: .75rem 0; }
     .samples audio { width: 220px; }
     .muted { color: #89929b; }
+    .hit {
+      border-left: 3px solid transparent;
+      cursor: pointer;
+      margin: .35rem 0;
+      padding: .35rem .5rem;
+    }
+    .hit.active {
+      background: #242a31;
+      border-left-color: #c77dff;
+    }
+    .hit button { margin-right: .5rem; }
+    #waveform-wrap {
+      margin: 1rem 0;
+      position: relative;
+      user-select: none;
+    }
+    #waveform {
+      background: #0c0e10;
+      display: block;
+      height: 96px;
+      width: 100%;
+    }
+    .keys { font-size: 12px; margin-top: .5rem; }
+    .row { align-items: center; display: flex; flex-wrap: wrap; gap: .5rem; }
   </style>
 </head>
 <body>
   <h1>WORD<span style="color:#c77dff">BANK</span></h1>
   <section class="panel">
-    <input type="file" id="file" accept="audio/*">
-    <input id="speaker" placeholder="speaker">
-    <button id="upload">INGEST</button>
-    <span id="status" class="muted"></span>
+    <div class="row">
+      <input type="file" id="file" accept="audio/*" multiple>
+      <input id="speaker" placeholder="speaker label (typed, not diarized)">
+      <button id="upload">INGEST</button>
+      <button id="upload-batch">BATCH INGEST</button>
+      <span id="status" class="muted"></span>
+    </div>
+    <p class="muted keys">Speaker is a label you type at upload — not automatic diarization.</p>
+    <div class="row" style="margin-top:.75rem">
+      <input id="youtube-url" placeholder="YouTube URL" style="flex:1;min-width:16rem">
+      <input id="yt-start" placeholder="start 0 or 1:05" style="width:7rem">
+      <input id="yt-end" placeholder="end (blank= +30s)" style="width:8rem">
+      <button id="youtube-import">IMPORT YOUTUBE</button>
+    </div>
+    <p class="muted keys">
+      Paste a YouTube link and a time window. Leave end blank for a 30-second grab from start
+      (start defaults to 0). Times accept seconds or MM:SS.
+    </p>
   </section>
   <section class="panel">
-    <input id="query" placeholder="search words or phrases">
-    <input id="filter" placeholder="speaker">
-    <input id="search-limit" type="number" min="1" value="50">
-    <button id="search">SEARCH</button>
+    <div class="row">
+      <input id="query" placeholder="search words or phrases">
+      <input id="filter" placeholder="speaker">
+      <input id="search-limit" type="number" min="1" value="50">
+      <button id="search">SEARCH</button>
+    </div>
+    <p class="muted keys">
+      Keyboard: ↑/↓ or j/k select hit · Enter/Space preview · ←/→ nudge selection · Esc clear
+    </p>
     <div id="results"></div>
   </section>
   <section class="panel">
     <h2 id="cliptitle">Transcript</h2>
     <audio id="player" controls></audio>
+    <div id="waveform-wrap">
+      <canvas id="waveform" height="96"></canvas>
+    </div>
     <div id="transcript"></div>
-    <label>Before <input id="before" type="number" step=".01" value="-.08"></label>
-    <label>After <input id="after" type="number" step=".01" value=".12"></label>
-    <input id="sample-label" placeholder="sample label">
-    <input id="sample-tags" placeholder="tags,comma,separated">
-    <button id="make-sample">MAKE SAMPLE</button>
+    <div class="row" style="margin-top:1rem">
+      <label>Before <input id="before" type="number" step=".01" value="-.08"></label>
+      <label>After <input id="after" type="number" step=".01" value=".12"></label>
+      <input id="sample-label" placeholder="sample label">
+      <input id="sample-tags" placeholder="tags,comma,separated">
+      <label><input id="publish-on-make" type="checkbox"> publish to DJ folder</label>
+      <button id="make-sample">MAKE SAMPLE</button>
+      <button id="timing-btn">TIMING REPORT</button>
+    </div>
+    <pre id="timing" class="muted" style="white-space:pre-wrap"></pre>
   </section>
   <section class="panel samples">
     <h2>Sample library</h2>
+    <p class="muted keys">Export folder: <span id="export-dir">…</span></p>
     <div id="library"></div>
   </section>
   <script>
@@ -68,8 +121,26 @@
     let selected = [];
     let selectionAnchor = null;
     let dragging = false;
+    let hits = [];
+    let hitIndex = -1;
+    let waveformPeaks = null;
+    let waveformDrag = null;
+    let audioContext = null;
+    let waveformGeneration = 0;
+    let previewTimer = null;
+    let youtubeBusy = false;
 
     const element = (id) => document.getElementById(id);
+
+    async function readError(response) {
+      try {
+        const data = await response.json();
+        if (typeof data.detail === "string") return data.detail;
+        return JSON.stringify(data.detail || data);
+      } catch (_error) {
+        return response.statusText || `HTTP ${response.status}`;
+      }
+    }
 
     function setSelection(start, end = start) {
       selected = [Math.min(start, end), Math.max(start, end)];
@@ -80,6 +151,40 @@
           index >= selected[0] && index <= selected[1],
         );
       });
+      drawWaveform();
+    }
+
+    function selectionSpan() {
+      if (!clip || !clip.duration || selected.length === 0) {
+        return null;
+      }
+      const words = clip.words;
+      const padBefore = Number(element("before").value);
+      const padAfter = Number(element("after").value);
+      const wordStart = words[selected[0]].start;
+      const wordEnd = words[selected[1]].end;
+      const start = Math.max(0, wordStart + padBefore);
+      const end = Math.max(start, Math.min(clip.duration, wordEnd + padAfter));
+      return { wordStart, wordEnd, start, end, padBefore, padAfter };
+    }
+
+    function cueSelection() {
+      if (!clip || selected.length === 0) {
+        return;
+      }
+      const span = selectionSpan();
+      const player = element("player");
+      if (previewTimer) {
+        clearTimeout(previewTimer);
+      }
+      player.currentTime = span ? span.start : clip.words[selected[0]].start;
+      player.play();
+      if (span) {
+        const ms = Math.max(50, (span.end - span.start) * 1000);
+        previewTimer = setTimeout(() => {
+          player.pause();
+        }, ms);
+      }
     }
 
     function cueWord(index) {
@@ -89,7 +194,7 @@
 
     function renderTranscript() {
       element("cliptitle").textContent = clip.original_filename;
-      element("player").src = `/clips/${clip.id}/audio`;
+      element("player").src = `/clips/${clip.id}/audio?ts=${Date.now()}`;
       const transcript = element("transcript");
       transcript.innerHTML = "";
       clip.words.forEach((word, index) => {
@@ -111,26 +216,167 @@
         });
         transcript.appendChild(wordElement);
       });
+      loadWaveform(clip.id);
+      element("timing").textContent = "";
+    }
+
+    async function loadWaveform(clipId) {
+      const generation = ++waveformGeneration;
+      waveformPeaks = null;
+      drawWaveform();
+      try {
+        const response = await fetch(`/clips/${clipId}/audio?ts=${Date.now()}`);
+        if (!response.ok) {
+          throw new Error(await readError(response));
+        }
+        const buffer = await response.arrayBuffer();
+        if (generation !== waveformGeneration) {
+          return;
+        }
+        audioContext = audioContext || new AudioContext();
+        if (audioContext.state === "suspended") {
+          await audioContext.resume();
+        }
+        const decoded = await audioContext.decodeAudioData(buffer.slice(0));
+        if (generation !== waveformGeneration) {
+          return;
+        }
+        const channel = decoded.getChannelData(0);
+        const buckets = 800;
+        const peaks = new Float32Array(buckets);
+        const block = Math.max(1, Math.floor(channel.length / buckets));
+        for (let i = 0; i < buckets; i += 1) {
+          let peak = 0;
+          const offset = i * block;
+          for (let j = 0; j < block && offset + j < channel.length; j += 1) {
+            peak = Math.max(peak, Math.abs(channel[offset + j]));
+          }
+          peaks[i] = peak;
+        }
+        waveformPeaks = peaks;
+        drawWaveform();
+      } catch (error) {
+        if (generation === waveformGeneration) {
+          element("status").textContent = ` waveform unavailable: ${error.message}`;
+        }
+      }
+    }
+
+    function drawWaveform() {
+      const canvas = element("waveform");
+      const ratio = window.devicePixelRatio || 1;
+      const width = canvas.clientWidth || canvas.parentElement.clientWidth || 800;
+      const height = 96;
+      canvas.width = Math.floor(width * ratio);
+      canvas.height = Math.floor(height * ratio);
+      canvas.style.width = `${width}px`;
+      canvas.style.height = `${height}px`;
+      const ctx = canvas.getContext("2d");
+      ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+      ctx.fillStyle = "#0c0e10";
+      ctx.fillRect(0, 0, width, height);
+      if (!clip || !clip.duration) {
+        return;
+      }
+      if (waveformPeaks) {
+        ctx.fillStyle = "#4b5560";
+        const mid = height / 2;
+        for (let i = 0; i < waveformPeaks.length; i += 1) {
+          const x = (i / waveformPeaks.length) * width;
+          const amp = waveformPeaks[i] * (height * 0.45);
+          ctx.fillRect(x, mid - amp, Math.max(1, width / waveformPeaks.length), amp * 2);
+        }
+      }
+      const span = selectionSpan();
+      if (!span) {
+        return;
+      }
+      const xWord0 = (span.wordStart / clip.duration) * width;
+      const xWord1 = (span.wordEnd / clip.duration) * width;
+      const x0 = (span.start / clip.duration) * width;
+      const x1 = (span.end / clip.duration) * width;
+      ctx.fillStyle = "rgba(199, 125, 255, 0.18)";
+      ctx.fillRect(x0, 0, Math.max(1, x1 - x0), height);
+      ctx.fillStyle = "rgba(199, 125, 255, 0.35)";
+      ctx.fillRect(xWord0, 0, Math.max(1, xWord1 - xWord0), height);
+      ctx.fillStyle = "#c77dff";
+      ctx.fillRect(x0 - 2, 0, 4, height);
+      ctx.fillRect(x1 - 2, 0, 4, height);
+      ctx.fillStyle = "#89b4fa";
+      ctx.fillRect(xWord0 - 1, 0, 2, height);
+      ctx.fillRect(xWord1 - 1, 0, 2, height);
+    }
+
+    function waveformTimeAt(clientX) {
+      const canvas = element("waveform");
+      const rect = canvas.getBoundingClientRect();
+      const ratio = Math.min(1, Math.max(0, (clientX - rect.left) / rect.width));
+      return ratio * clip.duration;
+    }
+
+    function beginWaveformDrag(event) {
+      if (!clip || selected.length === 0) {
+        return;
+      }
+      const span = selectionSpan();
+      const time = waveformTimeAt(event.clientX);
+      const distStart = Math.abs(time - span.start);
+      const distEnd = Math.abs(time - span.end);
+      waveformDrag = distStart <= distEnd ? "before" : "after";
+      updatePadFromWaveform(time);
+      element("waveform").setPointerCapture(event.pointerId);
+    }
+
+    function updatePadFromWaveform(time) {
+      if (!waveformDrag || selected.length === 0) {
+        return;
+      }
+      const words = clip.words;
+      const wordStart = words[selected[0]].start;
+      const wordEnd = words[selected[1]].end;
+      if (waveformDrag === "before") {
+        const pad = Math.max(-wordStart, Math.min(clip.duration - wordStart, time - wordStart));
+        element("before").value = pad.toFixed(3);
+      } else {
+        const pad = Math.max(-wordEnd, Math.min(clip.duration - wordEnd, time - wordEnd));
+        element("after").value = pad.toFixed(3);
+      }
+      drawWaveform();
     }
 
     document.addEventListener("pointerup", () => {
       dragging = false;
+      waveformDrag = null;
     });
 
+    element("waveform").addEventListener("pointerdown", beginWaveformDrag);
+    element("waveform").addEventListener("pointermove", (event) => {
+      if (waveformDrag) {
+        updatePadFromWaveform(waveformTimeAt(event.clientX));
+      }
+    });
+    element("before").addEventListener("input", drawWaveform);
+    element("after").addEventListener("input", drawWaveform);
+    window.addEventListener("resize", drawWaveform);
+
     async function uploadClip() {
-      const file = element("file").files[0];
-      if (!file) {
+      const files = Array.from(element("file").files || []);
+      if (!files.length) {
+        return;
+      }
+      if (files.length > 1) {
+        element("status").textContent = " multiple files selected — use BATCH INGEST";
         return;
       }
       const form = new FormData();
-      form.append("file", file);
+      form.append("file", files[0]);
       if (element("speaker").value) {
         form.append("speaker", element("speaker").value);
       }
       element("status").textContent = " indexing…";
       const response = await fetch("/clips", { method: "POST", body: form });
       if (!response.ok) {
-        element("status").textContent = " upload failed";
+        element("status").textContent = ` upload failed: ${await readError(response)}`;
         return;
       }
       clip = await response.json();
@@ -140,43 +386,137 @@
       element("status").textContent = " ready";
     }
 
+    async function uploadBatch() {
+      const files = Array.from(element("file").files || []);
+      if (files.length === 0) {
+        return;
+      }
+      const form = new FormData();
+      files.forEach((file) => form.append("files", file));
+      if (element("speaker").value) {
+        form.append("speaker", element("speaker").value);
+      }
+      element("status").textContent = ` batch indexing ${files.length}…`;
+      const response = await fetch("/clips/batch", { method: "POST", body: form });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        element("status").textContent = ` batch failed: ${JSON.stringify(data.detail || data)}`;
+        return;
+      }
+      if (data.clips && data.clips.length) {
+        clip = data.clips[data.clips.length - 1];
+        selected = [];
+        renderTranscript();
+      }
+      await refreshSamples();
+      const errNote = (data.errors || []).length ? ` (${data.errors.length} errors)` : "";
+      element("status").textContent = ` batch ready: ${data.count} clips${errNote}`;
+    }
+
+    async function importYoutube() {
+      const url = element("youtube-url").value.trim();
+      if (!url || youtubeBusy) {
+        return;
+      }
+      const payload = { url };
+      if (element("speaker").value.trim()) {
+        payload.speaker = element("speaker").value.trim();
+      }
+      const start = element("yt-start").value.trim();
+      const end = element("yt-end").value.trim();
+      if (start) payload.start = start;
+      if (end) payload.end = end;
+      youtubeBusy = true;
+      element("youtube-import").disabled = true;
+      element("status").textContent = " fetching YouTube…";
+      try {
+        const response = await fetch("/clips/youtube", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+        if (!response.ok) {
+          element("status").textContent = ` YouTube import failed: ${await readError(response)}`;
+          return;
+        }
+        clip = await response.json();
+        selected = [];
+        renderTranscript();
+        await refreshSamples();
+        element("status").textContent = ` youtube ready (${clip.duration.toFixed(1)}s)`;
+      } finally {
+        youtubeBusy = false;
+        element("youtube-import").disabled = false;
+      }
+    }
+
+    function renderHits() {
+      element("results").innerHTML = "";
+      hits.forEach((hit, index) => {
+        const row = document.createElement("div");
+        row.className = `hit${index === hitIndex ? " active" : ""}`;
+        const button = document.createElement("button");
+        button.textContent = hit.text;
+        button.addEventListener("click", () => {
+          hitIndex = index;
+          renderHits();
+          loadClip(hit);
+        });
+        row.appendChild(button);
+        row.append(
+          document.createTextNode(
+            ` ${hit.speaker || ""} @ ${hit.start.toFixed(2)}s · ${hit.filename || ""}`,
+          ),
+        );
+        row.addEventListener("click", (event) => {
+          if (event.target === button) return;
+          hitIndex = index;
+          renderHits();
+          loadClip(hit);
+        });
+        element("results").appendChild(row);
+      });
+    }
+
     async function searchClips() {
       const parameters = new URLSearchParams({
         q: element("query").value,
         limit: element("search-limit").value || "50",
       });
       const speaker = element("filter").value.trim();
-      if (speaker) {
-        parameters.set("speaker", speaker);
-      }
+      if (speaker) parameters.set("speaker", speaker);
       const response = await fetch(`/search?${parameters}`);
+      if (!response.ok) {
+        element("status").textContent = ` search failed: ${await readError(response)}`;
+        return;
+      }
       const data = await response.json();
-      element("results").innerHTML = "";
-      data.hits.forEach((hit) => {
-        const row = document.createElement("p");
-        const button = document.createElement("button");
-        button.textContent = hit.text;
-        button.addEventListener("click", () => loadClip(hit));
-        row.appendChild(button);
-        row.append(` ${hit.speaker || ""} @ ${hit.start.toFixed(2)}s`);
-        element("results").appendChild(row);
-      });
+      hits = data.hits;
+      hitIndex = hits.length ? 0 : -1;
+      renderHits();
+      if (hitIndex >= 0) {
+        await loadClip(hits[hitIndex]);
+      }
     }
 
     async function loadClip(hit) {
       const response = await fetch(`/clips/${hit.clip_id}`);
+      if (!response.ok) {
+        element("status").textContent = ` load failed: ${await readError(response)}`;
+        return;
+      }
       clip = await response.json();
       renderTranscript();
       selectionAnchor = hit.word_start;
       setSelection(hit.word_start, hit.word_end);
-      cueWord(hit.word_start);
+      cueSelection();
     }
 
     async function makeSample() {
       if (!clip || selected.length === 0) {
         return;
       }
-      await fetch("/samples", {
+      const response = await fetch("/samples", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -187,52 +527,250 @@
           tags: element("sample-tags").value,
           pad_before: Number(element("before").value),
           pad_after: Number(element("after").value),
+          publish: element("publish-on-make").checked,
         }),
       });
+      if (!response.ok) {
+        element("status").textContent = ` sample failed: ${await readError(response)}`;
+        return;
+      }
+      const sample = await response.json();
+      if (sample.publish_error) {
+        element("status").textContent = ` sample saved; publish failed: ${sample.publish_error}`;
+      } else {
+        element("status").textContent = " sample saved";
+      }
       await refreshSamples();
+      await loadSettings();
+    }
+
+    async function showTiming() {
+      if (!clip) return;
+      const response = await fetch(`/clips/${clip.id}/timing`);
+      if (!response.ok) {
+        element("status").textContent = ` timing failed: ${await readError(response)}`;
+        return;
+      }
+      const report = await response.json();
+      element("timing").textContent = JSON.stringify(report, null, 2);
     }
 
     async function expandSample(sampleId) {
-      const before = Number(document.querySelector(
-        `[data-before="${sampleId}"]`,
-      ).value);
-      const after = Number(document.querySelector(
-        `[data-after="${sampleId}"]`,
-      ).value);
-      await fetch(`/samples/${sampleId}/expand`, {
+      const before = Number(document.querySelector(`[data-before="${sampleId}"]`).value);
+      const after = Number(document.querySelector(`[data-after="${sampleId}"]`).value);
+      const response = await fetch(`/samples/${sampleId}/expand`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ before, after }),
       });
+      if (!response.ok) {
+        element("status").textContent = ` expand failed: ${await readError(response)}`;
+        return;
+      }
+      await refreshSamples();
+    }
+
+    async function recutSample(sampleId) {
+      const padBefore = Number(document.querySelector(`[data-pad-before="${sampleId}"]`).value);
+      const padAfter = Number(document.querySelector(`[data-pad-after="${sampleId}"]`).value);
+      const response = await fetch(`/samples/${sampleId}/recut`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ pad_before: padBefore, pad_after: padAfter }),
+      });
+      if (!response.ok) {
+        element("status").textContent = ` recut failed: ${await readError(response)}`;
+        return;
+      }
+      element("status").textContent = " sample recut";
+      await refreshSamples();
+    }
+
+    async function publishSample(sampleId) {
+      const response = await fetch(`/samples/${sampleId}/publish`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: "{}",
+      });
+      if (!response.ok) {
+        element("status").textContent = ` publish failed: ${await readError(response)}`;
+        return;
+      }
+      const data = await response.json();
+      element("status").textContent = ` published → ${data.published_path}`;
+      await refreshSamples();
+      await loadSettings();
+    }
+
+    async function deleteSample(sampleId) {
+      if (!window.confirm("Delete this sample?")) {
+        return;
+      }
+      const response = await fetch(`/samples/${sampleId}`, { method: "DELETE" });
+      if (!response.ok) {
+        element("status").textContent = ` delete failed: ${await readError(response)}`;
+        return;
+      }
+      element("status").textContent = " sample deleted";
       await refreshSamples();
     }
 
     async function refreshSamples() {
       const response = await fetch("/samples");
+      if (!response.ok) {
+        element("status").textContent = ` library failed: ${await readError(response)}`;
+        return;
+      }
       const samples = await response.json();
-      element("library").innerHTML = "";
+      const library = element("library");
+      library.innerHTML = "";
       samples.forEach((sample) => {
         const row = document.createElement("div");
         row.className = "sample-row";
-        row.innerHTML = `
-          <strong>${sample.label || sample.text}</strong>
-          <span class="muted">${sample.speaker || ""}</span>
-          <audio controls src="/samples/${sample.id}/audio"></audio>
-          <a href="/samples/${sample.id}/audio" download>download</a>
-          <label>before <input data-before="${sample.id}" type="number" value="0" min="0"></label>
-          <label>after <input data-after="${sample.id}" type="number" value="0" min="0"></label>
-        `;
-        const button = document.createElement("button");
-        button.textContent = "EXPAND";
-        button.addEventListener("click", () => expandSample(sample.id));
-        row.appendChild(button);
-        element("library").appendChild(row);
+        const title = document.createElement("strong");
+        title.textContent = sample.label || sample.text;
+        const speaker = document.createElement("span");
+        speaker.className = "muted";
+        speaker.textContent = ` ${sample.speaker || ""}`;
+        const audio = document.createElement("audio");
+        audio.controls = true;
+        audio.src = `/samples/${sample.id}/audio?ts=${Date.now()}`;
+        const link = document.createElement("a");
+        link.href = `/samples/${sample.id}/audio?ts=${Date.now()}`;
+        link.download = `${(sample.label || sample.text || "sample").replaceAll(" ", "_")}.wav`;
+        link.textContent = "download";
+        const wordsBefore = document.createElement("label");
+        wordsBefore.textContent = "words before ";
+        const beforeInput = document.createElement("input");
+        beforeInput.dataset.before = sample.id;
+        beforeInput.type = "number";
+        beforeInput.value = "0";
+        beforeInput.min = "0";
+        beforeInput.step = "1";
+        wordsBefore.appendChild(beforeInput);
+        const wordsAfter = document.createElement("label");
+        wordsAfter.textContent = "words after ";
+        const afterInput = document.createElement("input");
+        afterInput.dataset.after = sample.id;
+        afterInput.type = "number";
+        afterInput.value = "0";
+        afterInput.min = "0";
+        afterInput.step = "1";
+        wordsAfter.appendChild(afterInput);
+        const padBeforeLabel = document.createElement("label");
+        padBeforeLabel.textContent = "pad before ";
+        const padBefore = document.createElement("input");
+        padBefore.dataset.padBefore = sample.id;
+        padBefore.type = "number";
+        padBefore.step = "0.01";
+        padBefore.value = String(sample.pad_before);
+        padBeforeLabel.appendChild(padBefore);
+        const padAfterLabel = document.createElement("label");
+        padAfterLabel.textContent = "pad after ";
+        const padAfter = document.createElement("input");
+        padAfter.dataset.padAfter = sample.id;
+        padAfter.type = "number";
+        padAfter.step = "0.01";
+        padAfter.value = String(sample.pad_after);
+        padAfterLabel.appendChild(padAfter);
+        row.append(title, speaker, audio, link, wordsBefore, wordsAfter, padBeforeLabel, padAfterLabel);
+        const expand = document.createElement("button");
+        expand.textContent = "EXPAND";
+        expand.addEventListener("click", () => expandSample(sample.id));
+        const recut = document.createElement("button");
+        recut.textContent = "RECUT";
+        recut.addEventListener("click", () => recutSample(sample.id));
+        const publish = document.createElement("button");
+        publish.textContent = "PUBLISH";
+        publish.title = "Copy into DJ watch folder, named by label";
+        publish.addEventListener("click", () => publishSample(sample.id));
+        const remove = document.createElement("button");
+        remove.textContent = "DELETE";
+        remove.addEventListener("click", () => deleteSample(sample.id));
+        row.append(expand, recut, publish, remove);
+        if (sample.published_path) {
+          const published = document.createElement("div");
+          published.className = "muted keys";
+          published.textContent = `published: ${sample.published_path}`;
+          row.appendChild(published);
+        }
+        library.appendChild(row);
       });
     }
 
+    function typingTarget(event) {
+      const tag = (event.target && event.target.tagName) || "";
+      return tag === "INPUT" || tag === "TEXTAREA" || event.target.isContentEditable;
+    }
+
+    function nudgeSelection(delta) {
+      if (!clip || !clip.words.length || selected.length === 0) {
+        return;
+      }
+      const width = selected[1] - selected[0];
+      const next = Math.min(
+        clip.words.length - 1 - width,
+        Math.max(0, selected[0] + delta),
+      );
+      setSelection(next, next + width);
+      cueSelection();
+    }
+
+    async function onKeydown(event) {
+      if (typingTarget(event)) {
+        return;
+      }
+      if (event.key === "Escape") {
+        hits = [];
+        hitIndex = -1;
+        renderHits();
+        return;
+      }
+      if (event.key === "Enter" || event.key === " ") {
+        if (clip && selected.length) {
+          event.preventDefault();
+          cueSelection();
+        }
+        return;
+      }
+      if (event.key === "ArrowLeft" || event.key === "ArrowRight") {
+        if (!clip || selected.length === 0) return;
+        event.preventDefault();
+        nudgeSelection(event.key === "ArrowLeft" ? -1 : 1);
+        return;
+      }
+      if (!hits.length) {
+        return;
+      }
+      if (event.key === "ArrowDown" || event.key === "j") {
+        event.preventDefault();
+        hitIndex = Math.min(hits.length - 1, hitIndex + 1);
+        renderHits();
+        await loadClip(hits[hitIndex]);
+      } else if (event.key === "ArrowUp" || event.key === "k") {
+        event.preventDefault();
+        hitIndex = Math.max(0, hitIndex - 1);
+        renderHits();
+        await loadClip(hits[hitIndex]);
+      }
+    }
+
+    document.addEventListener("keydown", onKeydown);
     element("upload").addEventListener("click", uploadClip);
+    element("upload-batch").addEventListener("click", uploadBatch);
+    element("youtube-import").addEventListener("click", importYoutube);
     element("search").addEventListener("click", searchClips);
     element("make-sample").addEventListener("click", makeSample);
+    element("timing-btn").addEventListener("click", showTiming);
+
+    async function loadSettings() {
+      const response = await fetch("/settings");
+      if (!response.ok) return;
+      const data = await response.json();
+      element("export-dir").textContent = data.export_dir;
+    }
+
+    loadSettings();
     refreshSamples();
   </script>
 </body>
