@@ -6,8 +6,12 @@
   <string>com.iamfaulty.dj-music-sync</string>
   <key>ProgramArguments</key>
   <array>
-    <string>/Users/peteedoo/homelab-data/scripts/dj-music-sync.sh</string>
+    <string>/bin/sh</string>
+    <string>-c</string>
+    <string>mkdir -p /Volumes/homelab &amp;&amp; mount -t nfs -o resvport 192.168.68.69:/volume3/homelab /Volumes/homelab &amp;&amp; /Users/peteedoo/projects/dj/sync/dj-music-sync.sh</string>
   </array>
+  <key>UserName</key>
+  <string>root</string>
   <key>StartCalendarInterval</key>
   <dict>
     <key>Hour</key>
