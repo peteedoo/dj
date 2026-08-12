@@ -3,3 +3,12 @@
 
 # promote
 .promote.conf
+
+# wordbank
+wordbank/data/
+wordbank/*.wav
+wordbank/**/*.wav
+*.sqlite3
+.venv/
+*.egg-info/
+__pycache__/
